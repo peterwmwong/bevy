@@ -1,3 +1,4 @@
+#![feature(iter_array_chunks)]
 //! Meshlet rendering for dense high-poly scenes (experimental).
 
 // Note: This example showcases the meshlet API, but is not the type of scene that would benefit from using meshlets.
@@ -6,30 +7,24 @@
 mod camera_controller;
 
 use bevy::{
-    pbr::{
-        experimental::meshlet::{MaterialMeshletMeshBundle, MeshletPlugin},
-        CascadeShadowConfigBuilder, DirectionalLightShadowMap,
-    },
+    asset::io::file::FileAssetReader,
+    pbr::experimental::meshlet::MeshletPlugin,
     prelude::*,
-    render::render_resource::AsBindGroup,
+    render::{
+        mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
+        render_asset::RenderAssetUsages,
+        render_resource::{AsBindGroup, ShaderRef},
+    },
 };
 use camera_controller::{CameraController, CameraControllerPlugin};
-use std::{f32::consts::PI, path::Path, process::ExitCode};
-
-const ASSET_URL: &str = "https://raw.githubusercontent.com/JMS55/bevy_meshlet_asset/bd869887bc5c9c6e74e353f657d342bef84bacd8/bunny.meshlet_mesh";
+use std::{f32::consts::PI, fs::File, io::BufReader, process::ExitCode};
 
 fn main() -> ExitCode {
-    if !Path::new("./assets/models/bunny.meshlet_mesh").exists() {
-        eprintln!("ERROR: Asset at path <bevy>/assets/models/bunny.meshlet_mesh is missing. Please download it from {ASSET_URL}");
-        return ExitCode::FAILURE;
-    }
-
     App::new()
-        .insert_resource(DirectionalLightShadowMap { size: 4096 })
         .add_plugins((
             DefaultPlugins,
             MeshletPlugin,
-            MaterialPlugin::<MeshletDebugMaterial>::default(),
+            MaterialPlugin::<DebugPrimitiveIDMaterial>::default(),
             CameraControllerPlugin,
         ))
         .add_systems(Startup, setup)
@@ -40,99 +35,84 @@ fn main() -> ExitCode {
 
 fn setup(
     mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mut standard_materials: ResMut<Assets<StandardMaterial>>,
-    mut debug_materials: ResMut<Assets<MeshletDebugMaterial>>,
+    _asset_server: Res<AssetServer>,
+    mut _standard_materials: ResMut<Assets<StandardMaterial>>,
+    mut debug_materials: ResMut<Assets<DebugPrimitiveIDMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
+    // Load model mesh
+    let mesh = {
+        let model_path = FileAssetReader::new("assets/models/bunny.obj");
+        let model_path = model_path.root_path();
+        let mut reader = BufReader::new(
+            File::open(model_path)
+                .expect(&format!("Failed to open model OBJ file: {model_path:?}")),
+        );
+        let (models, _) = tobj::load_obj_buf(
+            &mut reader,
+            &tobj::LoadOptions {
+                single_index: true,
+                triangulate: false,
+                ignore_points: true,
+                ignore_lines: true,
+            },
+            move |_| Ok((vec![], ahash::AHashMap::new())),
+        )
+        .expect(&format!("Failed to read model OBJ file: {model_path:?}"));
+        let tobj::Model {
+            mesh: tobj::Mesh {
+                indices, positions, ..
+            },
+            ..
+        } = models.into_iter().next().expect(&format!(
+            "Expected atleast one model in OBJ file: {model_path:?}"
+        ));
+        let mut m = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        m.insert_indices(Indices::U32(indices));
+        m.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            VertexAttributeValues::Float32x3(positions.into_iter().array_chunks::<3>().collect()),
+        );
+        meshes.add(m)
+    };
+
     commands.spawn((
         Camera3dBundle {
-            transform: Transform::from_translation(Vec3::new(1.8, 0.4, -0.1))
-                .looking_at(Vec3::ZERO, Vec3::Y),
+            transform: Transform::from_translation(Vec3::new(0., 0.5, -0.5))
+                .looking_at(Vec3::new(0., 0.1, 0.), Vec3::Y),
             ..default()
         },
-        EnvironmentMapLight {
-            diffuse_map: asset_server.load("environment_maps/pisa_diffuse_rgb9e5_zstd.ktx2"),
-            specular_map: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
-            intensity: 150.0,
+        CameraController {
+            sensitivity: 0.25,
+            walk_speed: 0.5,
+            key_forward: KeyCode::KeyE,
+            key_back: KeyCode::KeyD,
+            key_left: KeyCode::KeyS,
+            key_right: KeyCode::KeyF,
+            key_up: KeyCode::KeyR,
+            key_down: KeyCode::KeyW,
+            ..CameraController::default()
         },
-        CameraController::default(),
     ));
 
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
-            illuminance: light_consts::lux::FULL_DAYLIGHT,
-            shadows_enabled: true,
-            ..default()
-        },
-        cascade_shadow_config: CascadeShadowConfigBuilder {
-            num_cascades: 1,
-            maximum_distance: 15.0,
-            ..default()
-        }
-        .build(),
-        transform: Transform::from_rotation(Quat::from_euler(
-            EulerRot::ZYX,
-            0.0,
-            PI * -0.15,
-            PI * -0.15,
-        )),
-        ..default()
-    });
-
-    // A custom file format storing a [`bevy_render::mesh::Mesh`]
-    // that has been converted to a [`bevy_pbr::meshlet::MeshletMesh`]
-    // using [`bevy_pbr::meshlet::MeshletMesh::from_mesh`], which is
-    // a function only available when the `meshlet_processor` cargo feature is enabled.
-    let meshlet_mesh_handle = asset_server.load("models/bunny.meshlet_mesh");
-    let debug_material = debug_materials.add(MeshletDebugMaterial::default());
-
-    for x in -2..=2 {
-        commands.spawn(MaterialMeshletMeshBundle {
-            meshlet_mesh: meshlet_mesh_handle.clone(),
-            material: standard_materials.add(StandardMaterial {
-                base_color: match x {
-                    -2 => Srgba::hex("#dc2626").unwrap().into(),
-                    -1 => Srgba::hex("#ea580c").unwrap().into(),
-                    0 => Srgba::hex("#facc15").unwrap().into(),
-                    1 => Srgba::hex("#16a34a").unwrap().into(),
-                    2 => Srgba::hex("#0284c7").unwrap().into(),
-                    _ => unreachable!(),
-                },
-                perceptual_roughness: (x + 2) as f32 / 4.0,
-                ..default()
-            }),
-            transform: Transform::default()
-                .with_scale(Vec3::splat(0.2))
-                .with_translation(Vec3::new(x as f32 / 2.0, 0.0, -0.3)),
-            ..default()
-        });
-    }
-    for x in -2..=2 {
-        commands.spawn(MaterialMeshletMeshBundle {
-            meshlet_mesh: meshlet_mesh_handle.clone(),
-            material: debug_material.clone(),
-            transform: Transform::default()
-                .with_scale(Vec3::splat(0.2))
-                .with_rotation(Quat::from_rotation_y(PI))
-                .with_translation(Vec3::new(x as f32 / 2.0, 0.0, 0.3)),
-            ..default()
-        });
-    }
-
-    commands.spawn(PbrBundle {
-        mesh: meshes.add(Plane3d::default().mesh().size(5.0, 5.0)),
-        material: standard_materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            perceptual_roughness: 1.0,
-            ..default()
-        }),
+    commands.spawn(MaterialMeshBundle {
+        mesh,
+        material: debug_materials.add(DebugPrimitiveIDMaterial::default()),
+        transform: Transform::default()
+            .with_scale(Vec3::splat(0.2))
+            .with_rotation(Quat::from_rotation_y(PI))
+            .with_translation(Vec3::new(0., 0.0, 0.)),
         ..default()
     });
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Clone, Default)]
-struct MeshletDebugMaterial {
-    _dummy: (),
+struct DebugPrimitiveIDMaterial {}
+impl Material for DebugPrimitiveIDMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/debug_primitive_id.wgsl".into()
+    }
 }
-impl Material for MeshletDebugMaterial {}
