@@ -8,7 +8,7 @@ mod camera_controller;
 
 use bevy::{
     asset::io::file::FileAssetReader,
-    pbr::experimental::meshlet::MeshletPlugin,
+    pbr::experimental::meshlet::{MaterialMeshletMeshBundle, MeshletMesh, MeshletPlugin},
     prelude::*,
     render::{
         mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
@@ -38,10 +38,10 @@ fn setup(
     _asset_server: Res<AssetServer>,
     mut _standard_materials: ResMut<Assets<StandardMaterial>>,
     mut debug_materials: ResMut<Assets<DebugPrimitiveIDMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<MeshletMesh>>,
 ) {
     // Load model mesh
-    let mesh = {
+    let meshlet_mesh: Handle<MeshletMesh> = {
         let model_path = FileAssetReader::new("assets/models/bunny.obj");
         let model_path = model_path.root_path();
         let mut reader = BufReader::new(
@@ -60,9 +60,14 @@ fn setup(
         )
         .expect(&format!("Failed to read model OBJ file: {model_path:?}"));
         let tobj::Model {
-            mesh: tobj::Mesh {
-                indices, positions, ..
-            },
+            mesh:
+                tobj::Mesh {
+                    indices,
+                    positions,
+                    normals,
+                    texcoords,
+                    ..
+                },
             ..
         } = models.into_iter().next().expect(&format!(
             "Expected atleast one model in OBJ file: {model_path:?}"
@@ -76,7 +81,17 @@ fn setup(
             Mesh::ATTRIBUTE_POSITION,
             VertexAttributeValues::Float32x3(positions.into_iter().array_chunks::<3>().collect()),
         );
-        meshes.add(m)
+        m.insert_attribute(
+            Mesh::ATTRIBUTE_NORMAL,
+            VertexAttributeValues::Float32x3(normals.into_iter().array_chunks::<3>().collect()),
+        );
+        m.insert_attribute(
+            Mesh::ATTRIBUTE_UV_0,
+            VertexAttributeValues::Float32x2(texcoords.into_iter().array_chunks::<2>().collect()),
+        );
+        m.generate_tangents().unwrap();
+        let meshlet_mesh = MeshletMesh::from_mesh(&m).unwrap();
+        meshes.add(meshlet_mesh)
     };
 
     commands.spawn((
@@ -98,8 +113,8 @@ fn setup(
         },
     ));
 
-    commands.spawn(MaterialMeshBundle {
-        mesh,
+    commands.spawn(MaterialMeshletMeshBundle {
+        meshlet_mesh,
         material: debug_materials.add(DebugPrimitiveIDMaterial::default()),
         transform: Transform::default()
             .with_scale(Vec3::splat(0.2))
