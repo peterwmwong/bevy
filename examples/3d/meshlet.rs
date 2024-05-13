@@ -7,17 +7,16 @@
 mod camera_controller;
 
 use bevy::{
-    asset::io::file::FileAssetReader,
-    pbr::experimental::meshlet::{MaterialMeshletMeshBundle, MeshletMesh, MeshletPlugin},
-    prelude::*,
-    render::{
-        mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
-        render_asset::RenderAssetUsages,
-        render_resource::{AsBindGroup, ShaderRef},
+    asset::AssetLoader,
+    pbr::experimental::meshlet::{
+        MaterialMeshletMeshBundle, MeshletMesh, MeshletMeshSaverLoad, MeshletPlugin,
     },
+    prelude::*,
+    render::render_resource::{AsBindGroup, ShaderRef},
+    tasks::block_on,
 };
 use camera_controller::{CameraController, CameraControllerPlugin};
-use std::{f32::consts::PI, fs::File, io::BufReader, process::ExitCode};
+use std::{f32::consts::PI, process::ExitCode};
 
 fn main() -> ExitCode {
     App::new()
@@ -42,55 +41,17 @@ fn setup(
 ) {
     // Load model mesh
     let meshlet_mesh: Handle<MeshletMesh> = {
-        let model_path = FileAssetReader::new("assets/models/bunny.obj");
-        let model_path = model_path.root_path();
-        let mut reader = BufReader::new(
-            File::open(model_path)
-                .expect(&format!("Failed to open model OBJ file: {model_path:?}")),
-        );
-        let (models, _) = tobj::load_obj_buf(
+        let mut reader = block_on(async_fs::File::open("/tmp/bevy_meshlet.meshlets")).unwrap();
+        let meshlet_mesh = block_on(<MeshletMeshSaverLoad as AssetLoader>::load(
+            &MeshletMeshSaverLoad,
             &mut reader,
-            &tobj::LoadOptions {
-                single_index: true,
-                triangulate: false,
-                ignore_points: true,
-                ignore_lines: true,
+            &(),
+            #[allow(unsafe_code, deref_nullptr)]
+            unsafe {
+                &mut *core::ptr::null_mut()
             },
-            move |_| Ok((vec![], ahash::AHashMap::new())),
-        )
-        .expect(&format!("Failed to read model OBJ file: {model_path:?}"));
-        let tobj::Model {
-            mesh:
-                tobj::Mesh {
-                    indices,
-                    positions,
-                    normals,
-                    texcoords,
-                    ..
-                },
-            ..
-        } = models.into_iter().next().expect(&format!(
-            "Expected atleast one model in OBJ file: {model_path:?}"
-        ));
-        let mut m = Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::RENDER_WORLD,
-        );
-        m.insert_indices(Indices::U32(indices));
-        m.insert_attribute(
-            Mesh::ATTRIBUTE_POSITION,
-            VertexAttributeValues::Float32x3(positions.into_iter().array_chunks::<3>().collect()),
-        );
-        m.insert_attribute(
-            Mesh::ATTRIBUTE_NORMAL,
-            VertexAttributeValues::Float32x3(normals.into_iter().array_chunks::<3>().collect()),
-        );
-        m.insert_attribute(
-            Mesh::ATTRIBUTE_UV_0,
-            VertexAttributeValues::Float32x2(texcoords.into_iter().array_chunks::<2>().collect()),
-        );
-        m.generate_tangents().unwrap();
-        let meshlet_mesh = MeshletMesh::from_mesh(&m).unwrap();
+        ))
+        .unwrap();
         meshes.add(meshlet_mesh)
     };
 
