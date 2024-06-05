@@ -1,4 +1,10 @@
-use super::asset::{Meshlet, MeshletBoundingSphere, MeshletBoundingSpheres, MeshletMesh};
+use crate::meshlet::min_max::MinMax;
+
+use super::{
+    asset::{Meshlet, MeshletBoundingSphere, MeshletBoundingSpheres, MeshletMesh},
+    EncodedVertexPosition,
+};
+use bevy_math::Vec3;
 use bevy_render::{
     mesh::{Indices, Mesh},
     render_resource::PrimitiveTopology,
@@ -11,7 +17,7 @@ use meshopt::{
     simplify, simplify_scale, Meshlets, SimplifyOptions, VertexDataAdapter,
 };
 use metis::Graph;
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, ops::Range, path::Path, sync::Arc};
 
 impl MeshletMesh {
     /// Process a [`Mesh`] to generate a [`MeshletMesh`].
@@ -24,7 +30,10 @@ impl MeshletMesh {
     /// 1. Use [`PrimitiveTopology::TriangleList`]
     /// 2. Use indices
     /// 3. Have the exact following set of vertex attributes: `{POSITION, NORMAL, UV_0, TANGENT}`
-    pub fn from_mesh(mesh: &Mesh) -> Result<Self, MeshToMeshletMeshConversionError> {
+    pub fn from_mesh(
+        mesh: &Mesh,
+        denorm_scale: [f32; 3],
+    ) -> Result<Self, MeshToMeshletMeshConversionError> {
         // Validate mesh format
         let indices = validate_input_mesh(mesh)?;
 
@@ -56,6 +65,8 @@ impl MeshletMesh {
             .sum();
 
         // Build further LODs
+        // TODO(pww): Temporarily disable building meshlet LODs to get the first LOD level correct.
+        /*
         let mut simplification_queue = 0..meshlets.len();
         let mut lod_level = 1;
         while simplification_queue.len() > 1 {
@@ -131,6 +142,7 @@ impl MeshletMesh {
             simplification_queue = next_lod_start..meshlets.len();
             lod_level += 1;
         }
+         */
 
         // Convert meshopt_Meshlet data to a custom format
         let bevy_meshlets = meshlets
@@ -143,14 +155,258 @@ impl MeshletMesh {
             })
             .collect();
 
+        let mut vertex_positions: Vec<EncodedVertexPosition>;
+        #[allow(unsafe_code)]
+        unsafe {
+            let vertex_count = vertex_buffer.len() / vertex_stride;
+            const POSITION_BYTE_OFFSET: usize = 0;
+            let start = vertex_buffer.as_ptr().byte_add(POSITION_BYTE_OFFSET);
+            vertex_positions = vec![EncodedVertexPosition::ZERO; vertex_count];
+            for i in 0..vertex_count {
+                let p: [f32; 3] = *(start.byte_add(i * vertex_stride) as *const [f32; 3]);
+                let p_norm: [f32; 3] = core::array::from_fn(|i| p[i] / denorm_scale[i]);
+                let p_quant = EncodedVertexPosition::from_f32(&p_norm);
+                vertex_positions[i] = p_quant;
+            }
+        }
+
         Ok(Self {
             worst_case_meshlet_triangles,
+            denorm_scale,
             vertex_data: vertex_buffer.into(),
             vertex_ids: meshlets.vertices.into(),
             indices: meshlets.triangles.into(),
+            vertex_positions: vertex_positions.into(),
             meshlets: bevy_meshlets,
             bounding_spheres: bounding_spheres.into(),
         })
+    }
+
+    pub fn export_for_xmetal(&self) {
+        // pub type MeshletIndexType = u8;
+        // pub type MeshletToMeshType = u8;
+        // pub type MeshletVertexIndexType = u32;
+
+        #[allow(non_camel_case_types)]
+        #[repr(C)]
+        #[derive(Copy, Clone, PartialEq)]
+        pub struct packed_float3 {
+            pub xyz: [f32; 3usize],
+        }
+
+        #[allow(non_camel_case_types)]
+        #[repr(C)]
+        #[derive(Copy, Clone, PartialEq)]
+        pub struct packed_half3 {
+            pub xyz: [half::f16; 3],
+        }
+
+        impl packed_half3 {
+            pub const ZERO: Self = Self {
+                xyz: [half::f16::from_f32_const(0.); 3],
+            };
+        }
+        impl From<Vec3> for packed_half3 {
+            fn from(value: Vec3) -> Self {
+                packed_half3 {
+                    xyz: [0, 1, 2].map(|c| half::f16::from_f32_const(value[c])),
+                }
+            }
+        }
+
+        #[repr(C)]
+        #[derive(Copy, Clone, PartialEq)]
+        pub struct EncodedVertexPosition([u16; 3]);
+
+        #[repr(C)]
+        #[derive(Copy, Clone, PartialEq)]
+        pub struct Mesh {
+            pub base_material_id: ::std::os::raw::c_uchar,
+            pub roughness_material_id: ::std::os::raw::c_uchar,
+            pub metalness_material_id: ::std::os::raw::c_uchar,
+            pub normal_material_id: ::std::os::raw::c_uchar,
+        }
+
+        #[repr(C)]
+        #[derive(Copy, Clone, PartialEq)]
+        pub struct MeshletBounds {
+            pub cone_apex: packed_half3,
+            pub cone_axis: packed_half3,
+            pub cone_cutoff: half::f16,
+            pub center: packed_half3,
+            pub radius: half::f16,
+        }
+
+        #[repr(C)]
+        #[derive(Copy, Clone, PartialEq)]
+        #[cfg_attr(debug_assertions, derive(Debug))]
+        pub struct ModelMetadata {
+            pub(crate) meshes_len: u32,
+            pub(crate) meshlets_len: u32,
+            // TODO(0): Replace indices_len with triangle_count to save 1.5 bits (or increase
+            //          amount by 3x).
+            pub(crate) meshlet_indices_len: u32,
+            pub(crate) meshlet_vertices_len: u32,
+            pub(crate) vertices_len: u32,
+        }
+
+        pub const MESHLET_TRIANGLE_COUNT_NUM_BITS: ::std::os::raw::c_uint = 8;
+        pub const MESHLET_INDICES_NUM_BITS: ::std::os::raw::c_uint = 24;
+        pub const MESHLET_INDEX_ALIGNMENT_POW_2: ::std::os::raw::c_uint = 2;
+        const MESHLET_INDEX_ALIGNMENT: u32 = 1 << MESHLET_INDEX_ALIGNMENT_POW_2;
+        const MESHLET_INDEX_ALIGNMENT_MASK: u32 = MESHLET_INDEX_ALIGNMENT - 1;
+
+        #[repr(C)]
+        #[derive(Copy, Clone, PartialEq)]
+        pub struct Meshlet {
+            pub raw: u32,
+            pub _vertices_start: u32,
+        }
+        impl Meshlet {
+            #[inline]
+            pub(crate) fn new(
+                indices_start: u32,
+                triangle_count: u32,
+                vertices_start: u32,
+            ) -> Self {
+                assert!(
+                    indices_start
+                        < ((1 << MESHLET_INDICES_NUM_BITS) << MESHLET_INDEX_ALIGNMENT_POW_2),
+                    "indices_start={indices_start} triangle_count={triangle_count}"
+                );
+                assert_eq!(
+                    indices_start & MESHLET_INDEX_ALIGNMENT_MASK,
+                    0,
+                    "indices_start={indices_start} triangle_count={triangle_count}"
+                );
+                assert!(
+                    triangle_count > 0
+                        && (triangle_count - 1) < (1 << MESHLET_TRIANGLE_COUNT_NUM_BITS),
+                    "indices_start={indices_start} triangle_count={triangle_count}"
+                );
+                Self {
+                    raw: ((indices_start >> MESHLET_INDEX_ALIGNMENT_POW_2)
+                        << MESHLET_TRIANGLE_COUNT_NUM_BITS)
+                        | ((triangle_count - 1) as u32),
+                    _vertices_start: vertices_start,
+                }
+            }
+
+            // #[cfg(debug_assertions)]
+            // pub fn indices_start(&self) -> u32 {
+            //     (self.raw >> MESHLET_TRIANGLE_COUNT_NUM_BITS) << MESHLET_INDEX_ALIGNMENT_POW_2
+            // }
+            // #[cfg(debug_assertions)]
+            // pub fn vertices_start(&self) -> u32 {
+            //     self._vertices_start
+            // }
+            // #[cfg(debug_assertions)]
+            // pub fn triangle_count(&self) -> u32 {
+            //     (self.raw & ((1 << MESHLET_TRIANGLE_COUNT_NUM_BITS) - 1)) + 1
+            // }
+            // // TODO(1): Move helper into a more relevant place, like a new MeshIndices(Vec<MeshletIndexType>).
+            // #[inline(always)]
+            // pub(crate) fn indices_padding(index_count: u32) -> u32 {
+            //     MESHLET_INDEX_ALIGNMENT_MASK
+            //         & (MESHLET_INDEX_ALIGNMENT - (MESHLET_INDEX_ALIGNMENT_MASK & index_count))
+            // }
+        }
+
+        fn write_file<T: Copy + Clone>(path: impl AsRef<Path>, t: &Arc<[T]>) {
+            println!("- writing: {:?}", path.as_ref());
+            #[allow(unsafe_code)]
+            let a = unsafe {
+                core::slice::from_raw_parts(
+                    t.as_ptr() as *const _,
+                    core::mem::size_of::<T>() * t.len(),
+                )
+            };
+            std::fs::write(path, a).unwrap();
+        }
+        macro_rules! filepath {
+            ($p:literal) => {
+                concat!("/Users/pwong/projects/x-metal2/target/aarch64-apple-darwin/debug/ExampleApp.app/Contents/Resources/models/model/", $p)
+            }
+        }
+
+        {
+            let m = ModelMetadata {
+                meshes_len: 1,
+                meshlets_len: self.meshlets.len() as _,
+                meshlet_indices_len: self.indices.len() as _,
+                meshlet_vertices_len: self.vertex_ids.len() as _,
+                vertices_len: self.vertex_positions.len() as _,
+            };
+            dbg!(m);
+            write_file(filepath!("geometry.info"), &[m].into());
+        }
+        write_file(
+            filepath!("meshlets.bin"),
+            &self
+                .meshlets
+                .iter()
+                .map(|m| Meshlet::new(m.start_index_id, m.triangle_count, m.start_vertex_id))
+                .collect::<Vec<Meshlet>>()
+                .into(),
+        );
+        write_file(
+            filepath!("bounds.bin"),
+            &self
+                .bounding_spheres
+                .iter()
+                .map(|b| MeshletBounds {
+                    center: b.self_culling.center.into(),
+                    radius: half::f16::from_f32_const(b.self_culling.radius),
+                    cone_apex: packed_half3::ZERO,
+                    cone_axis: packed_half3::ZERO,
+                    cone_cutoff: half::f16::from_f32_const(1.),
+                })
+                .collect::<Vec<MeshletBounds>>()
+                .into(),
+        );
+        write_file(filepath!("m_index.bin"), &self.indices);
+        write_file(filepath!("m_vertex.bin"), &self.vertex_ids);
+        write_file(filepath!("vertex_p.bin"), &self.vertex_positions);
+        write_file(filepath!("meshes_ds.bin"), &[self.denorm_scale].into());
+        write_file(
+            filepath!("m_mesh.bin"),
+            &core::iter::repeat(0)
+                .take(self.meshlets.len())
+                .collect::<Vec<u8>>()
+                .into(),
+        );
+        write_file(
+            filepath!("meshes.bin"),
+            &[Mesh {
+                base_material_id: 0,
+                roughness_material_id: 0,
+                metalness_material_id: 0,
+                normal_material_id: 0,
+            }]
+            .into(),
+        );
+        // TODO(0): Implement vertices
+        {
+            #[repr(C)]
+            #[derive(Copy, Clone, PartialEq)]
+            pub struct EncodedVertex {
+                pub positionxy: ::std::os::raw::c_uint,
+                pub positionz_n1: ::std::os::raw::c_uint,
+                pub n0_tangent_mikkt: ::std::os::raw::c_uint,
+                pub tx_coord: ::std::os::raw::c_uint,
+            }
+            let vertices: Arc<[EncodedVertex]> = core::iter::repeat(0)
+                .take(self.vertex_positions.len())
+                .map(|_| EncodedVertex {
+                    positionxy: 0,
+                    positionz_n1: 0,
+                    n0_tangent_mikkt: 0,
+                    tx_coord: 0,
+                })
+                .collect::<Vec<EncodedVertex>>()
+                .into();
+            write_file(filepath!("vertex.bin"), &vertices);
+        }
     }
 }
 
@@ -176,7 +432,7 @@ fn validate_input_mesh(mesh: &Mesh) -> Result<Cow<'_, [u32]>, MeshToMeshletMeshC
 }
 
 fn compute_meshlets(indices: &[u32], vertices: &VertexDataAdapter) -> Meshlets {
-    let mut meshlets = build_meshlets(indices, vertices, 64, 64, 0.0);
+    let mut meshlets = build_meshlets(indices, vertices, 64, 96, 0.0);
 
     for meshlet in &mut meshlets.meshlets {
         #[allow(unsafe_code)]

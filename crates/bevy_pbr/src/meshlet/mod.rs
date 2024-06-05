@@ -6,6 +6,7 @@ mod from_mesh;
 mod gpu_scene;
 mod material_draw_nodes;
 mod material_draw_prepare;
+pub mod min_max;
 mod persistent_buffer;
 mod persistent_buffer_impls;
 mod pipelines;

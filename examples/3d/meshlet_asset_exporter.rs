@@ -4,20 +4,19 @@
 // Note: This example showcases the exporting a meshlet asset.
 
 use bevy::{
-    asset::{io::file::FileAssetReader, saver::AssetSaver},
-    pbr::experimental::meshlet::{MeshletMesh, MeshletMeshSaverLoad},
+    asset::io::file::FileAssetReader,
+    pbr::{experimental::meshlet::MeshletMesh, MinMax},
     prelude::*,
     render::{
         mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
         render_asset::RenderAssetUsages,
     },
-    tasks::block_on,
-    utils::{hashbrown::HashMap, CowArc},
 };
 use std::{fs::File, io::BufReader, process::ExitCode};
 
 fn main() -> ExitCode {
     let mut m: Mesh;
+    let position_denorm_scale;
     {
         println!(">>> Loading Mesh...");
         let model_path = FileAssetReader::new("assets/models/bunny.obj");
@@ -57,7 +56,21 @@ fn main() -> ExitCode {
         m.insert_indices(Indices::U32(indices));
         m.insert_attribute(
             Mesh::ATTRIBUTE_POSITION,
-            VertexAttributeValues::Float32x3(positions.into_iter().array_chunks::<3>().collect()),
+            VertexAttributeValues::Float32x3({
+                let mut positions: Vec<[f32; 3]> =
+                    positions.into_iter().array_chunks::<3>().collect();
+                let mut min_max = MinMax::new();
+                for p in &positions {
+                    min_max.update(p);
+                }
+
+                let normalizer = min_max.signed_normalizer();
+                position_denorm_scale = normalizer.denorm_scale();
+                for p in &mut positions {
+                    *p = normalizer.denorm_scale_normalized_position(&normalizer.normalize(p));
+                }
+                positions
+            }),
         );
         m.insert_attribute(
             Mesh::ATTRIBUTE_NORMAL,
@@ -71,29 +84,11 @@ fn main() -> ExitCode {
         println!(">>> Done!");
     }
 
-    let meshlet_mesh;
-    {
-        println!(">>> Generating Meshlets...");
-        meshlet_mesh = MeshletMesh::from_mesh(&m).unwrap();
-        println!(">>> Done!");
-    };
-
-    {
-        println!(">>> Writing...");
-        let mut writer = block_on(async_fs::File::create("/tmp/bevy_meshlet.meshlets")).unwrap();
-        pub struct FakeSavedAsset<'a, A: Asset> {
-            _value: &'a A,
-            _labeled_assets: &'a HashMap<CowArc<'static, str>, ()>,
-        }
-        let fsa = FakeSavedAsset {
-            _value: &meshlet_mesh,
-            _labeled_assets: &HashMap::new(),
-        };
-        #[allow(unsafe_code)]
-        block_on(MeshletMeshSaverLoad.save(&mut writer, unsafe { core::mem::transmute(fsa) }, &()))
-            .unwrap();
-        println!(">>> Done!");
-    }
+    println!(">>> Generating Meshlets...");
+    let meshlet_mesh = MeshletMesh::from_mesh(&m, position_denorm_scale).unwrap();
+    println!(">>> Done!");
+    println!(">>> Writing...");
+    meshlet_mesh.export_for_xmetal();
 
     ExitCode::SUCCESS
 }

@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 // FIXME(3492): remove once docs are ready
 #![allow(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
@@ -50,6 +51,8 @@ pub use pbr_material::*;
 pub use prepass::*;
 pub use render::*;
 pub use ssao::*;
+
+pub use meshlet::min_max::MinMax;
 
 pub mod prelude {
     #[doc(hidden)]

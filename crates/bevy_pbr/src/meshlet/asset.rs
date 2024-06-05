@@ -13,6 +13,22 @@ use std::{io::Cursor, sync::Arc};
 /// The current version of the [`MeshletMesh`] asset format.
 pub const MESHLET_MESH_ASSET_VERSION: u64 = 0;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EncodedVertexPosition([i16; 3]);
+impl EncodedVertexPosition {
+    pub const ZERO: Self = Self([0; 3]);
+
+    #[inline]
+    pub fn from_f32(&p: &[f32; 3]) -> Self {
+        assert!(
+            p.iter().find(|&&c| c < -1. || c > 1.).is_none(),
+            "BAD POSITION: {p:?}"
+        );
+        Self(p.map(|c| (c * (i16::MAX as f32)) as i16))
+    }
+}
+
 /// A mesh that has been pre-processed into multiple small clusters of triangles called meshlets.
 ///
 /// A [`bevy_render::mesh::Mesh`] can be converted to a [`MeshletMesh`] using `MeshletMesh::from_mesh` when the `meshlet_processor` cargo feature is enabled.
@@ -27,10 +43,13 @@ pub const MESHLET_MESH_ASSET_VERSION: u64 = 0;
 /// * Limited control over [`bevy_render::render_resource::RenderPipelineDescriptor`] attributes.
 ///
 /// See also [`super::MaterialMeshletMeshBundle`] and [`super::MeshletPlugin`].
-#[derive(Asset, TypePath, Serialize, Deserialize, Clone)]
+#[derive(Asset, TypePath, Clone)]
 pub struct MeshletMesh {
     /// The total amount of triangles summed across all LOD 0 meshlets in the mesh.
     pub worst_case_meshlet_triangles: u64,
+    /// Vertex Positions
+    pub vertex_positions: Arc<[EncodedVertexPosition]>,
+    pub denorm_scale: [f32; 3],
     /// Raw vertex data bytes for the overall mesh.
     pub vertex_data: Arc<[u8]>,
     /// Indices into `vertex_data`.
@@ -96,9 +115,10 @@ impl AssetLoader for MeshletMeshSaverLoad {
 
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
-        let asset = bincode::deserialize_from(FrameDecoder::new(Cursor::new(bytes)))?;
-
-        Ok(asset)
+        // TODO(pww): Disabling since adding vertex_positions to MeshletMetal.
+        // let asset = bincode::deserialize_from(FrameDecoder::new(Cursor::new(bytes)))?;
+        // Ok(asset)
+        todo!()
     }
 
     fn extensions(&self) -> &[&str] {
@@ -124,7 +144,7 @@ impl AssetSaver for MeshletMeshSaverLoad {
 
         let mut bytes = Vec::new();
         let mut sync_writer = FrameEncoder::new(&mut bytes);
-        bincode::serialize_into(&mut sync_writer, asset.get())?;
+        // bincode::serialize_into(&mut sync_writer, asset.get())?;
         sync_writer.finish()?;
         writer.write_all(&bytes).await?;
 
