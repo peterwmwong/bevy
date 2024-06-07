@@ -2,7 +2,7 @@ use crate::meshlet::min_max::MinMax;
 
 use super::{
     asset::{Meshlet, MeshletBoundingSphere, MeshletBoundingSpheres, MeshletMesh},
-    EncodedVertexPosition,
+    EncodedVertexPosition, ModelMetadata,
 };
 use bevy_math::Vec3;
 use bevy_render::{
@@ -64,9 +64,19 @@ impl MeshletMesh {
             .map(|m| m.triangle_count as u64)
             .sum();
 
+        // Convert meshopt_Meshlet data to a custom format
+        let bevy_meshlets: Arc<[Meshlet]> = meshlets
+            .meshlets
+            .iter()
+            .map(|m| Meshlet {
+                start_vertex_id: m.vertex_offset,
+                start_index_id: m.triangle_offset,
+                triangle_count: m.triangle_count,
+            })
+            .collect();
+
         // Build further LODs
         // TODO(pww): Temporarily disable building meshlet LODs to get the first LOD level correct.
-        /*
         let mut simplification_queue = 0..meshlets.len();
         let mut lod_level = 1;
         while simplification_queue.len() > 1 {
@@ -142,18 +152,6 @@ impl MeshletMesh {
             simplification_queue = next_lod_start..meshlets.len();
             lod_level += 1;
         }
-         */
-
-        // Convert meshopt_Meshlet data to a custom format
-        let bevy_meshlets = meshlets
-            .meshlets
-            .into_iter()
-            .map(|m| Meshlet {
-                start_vertex_id: m.vertex_offset,
-                start_index_id: m.triangle_offset,
-                triangle_count: m.triangle_count,
-            })
-            .collect();
 
         let mut vertex_positions: Vec<EncodedVertexPosition>;
         #[allow(unsafe_code)]
@@ -171,6 +169,13 @@ impl MeshletMesh {
         }
 
         Ok(Self {
+            metadata: ModelMetadata {
+                meshes_len: 1,
+                meshlets_len: bevy_meshlets.len() as _,
+                meshlet_indices_len: meshlets.triangles.len() as _,
+                meshlet_vertices_len: meshlets.vertices.len() as _,
+                vertices_len: vertex_positions.len() as _,
+            },
             worst_case_meshlet_triangles,
             denorm_scale,
             vertex_data: vertex_buffer.into(),
@@ -235,19 +240,6 @@ impl MeshletMesh {
             pub cone_cutoff: half::f16,
             pub center: packed_half3,
             pub radius: half::f16,
-        }
-
-        #[repr(C)]
-        #[derive(Copy, Clone, PartialEq)]
-        #[cfg_attr(debug_assertions, derive(Debug))]
-        pub struct ModelMetadata {
-            pub(crate) meshes_len: u32,
-            pub(crate) meshlets_len: u32,
-            // TODO(0): Replace indices_len with triangle_count to save 1.5 bits (or increase
-            //          amount by 3x).
-            pub(crate) meshlet_indices_len: u32,
-            pub(crate) meshlet_vertices_len: u32,
-            pub(crate) vertices_len: u32,
         }
 
         pub const MESHLET_TRIANGLE_COUNT_NUM_BITS: ::std::os::raw::c_uint = 8;
@@ -329,17 +321,7 @@ impl MeshletMesh {
             }
         }
 
-        {
-            let m = ModelMetadata {
-                meshes_len: 1,
-                meshlets_len: self.meshlets.len() as _,
-                meshlet_indices_len: self.indices.len() as _,
-                meshlet_vertices_len: self.vertex_ids.len() as _,
-                vertices_len: self.vertex_positions.len() as _,
-            };
-            dbg!(m);
-            write_file(filepath!("geometry.info"), &[m].into());
-        }
+        write_file(filepath!("geometry.info"), &[self.metadata].into());
         write_file(
             filepath!("meshlets.bin"),
             &self

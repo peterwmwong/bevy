@@ -29,6 +29,19 @@ impl EncodedVertexPosition {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct ModelMetadata {
+    pub(crate) meshes_len: u32,
+    pub(crate) meshlets_len: u32,
+    // TODO(0): Replace indices_len with triangle_count to save 1.5 bits (or increase
+    //          amount by 3x).
+    pub(crate) meshlet_indices_len: u32,
+    pub(crate) meshlet_vertices_len: u32,
+    pub(crate) vertices_len: u32,
+}
+
 /// A mesh that has been pre-processed into multiple small clusters of triangles called meshlets.
 ///
 /// A [`bevy_render::mesh::Mesh`] can be converted to a [`MeshletMesh`] using `MeshletMesh::from_mesh` when the `meshlet_processor` cargo feature is enabled.
@@ -45,6 +58,7 @@ impl EncodedVertexPosition {
 /// See also [`super::MaterialMeshletMeshBundle`] and [`super::MeshletPlugin`].
 #[derive(Asset, TypePath, Clone)]
 pub struct MeshletMesh {
+    pub metadata: ModelMetadata,
     /// The total amount of triangles summed across all LOD 0 meshlets in the mesh.
     pub worst_case_meshlet_triangles: u64,
     /// Vertex Positions
