@@ -65,18 +65,8 @@ impl MeshletMesh {
             .sum();
 
         // Convert meshopt_Meshlet data to a custom format
-        let bevy_meshlets: Arc<[Meshlet]> = meshlets
-            .meshlets
-            .iter()
-            .map(|m| Meshlet {
-                start_vertex_id: m.vertex_offset,
-                start_index_id: m.triangle_offset,
-                triangle_count: m.triangle_count,
-            })
-            .collect();
 
         // Build further LODs
-        // TODO(pww): Temporarily disable building meshlet LODs to get the first LOD level correct.
         let mut simplification_queue = 0..meshlets.len();
         let mut lod_level = 1;
         while simplification_queue.len() > 1 {
@@ -171,7 +161,7 @@ impl MeshletMesh {
         Ok(Self {
             metadata: ModelMetadata {
                 meshes_len: 1,
-                meshlets_len: bevy_meshlets.len() as _,
+                meshlets_len: meshlets.len() as _,
                 meshlet_indices_len: meshlets.triangles.len() as _,
                 meshlet_vertices_len: meshlets.vertices.len() as _,
                 vertices_len: vertex_positions.len() as _,
@@ -182,7 +172,15 @@ impl MeshletMesh {
             vertex_ids: meshlets.vertices.into(),
             indices: meshlets.triangles.into(),
             vertex_positions: vertex_positions.into(),
-            meshlets: bevy_meshlets,
+            meshlets: meshlets
+                .meshlets
+                .iter()
+                .map(|m| Meshlet {
+                    start_vertex_id: m.vertex_offset,
+                    start_index_id: m.triangle_offset,
+                    triangle_count: m.triangle_count,
+                })
+                .collect(),
             bounding_spheres: bounding_spheres.into(),
         })
     }
@@ -232,9 +230,13 @@ impl MeshletMesh {
             pub normal_material_id: ::std::os::raw::c_uchar,
         }
 
+        pub const MESHLET_BOUNDS__ROOT_LOD_ID: u16 = 65535;
+
         #[repr(C)]
         #[derive(Copy, Clone, PartialEq)]
         pub struct MeshletBounds {
+            pub lod_self_id: u16,
+            pub lod_parent_id: u16,
             pub cone_apex: packed_half3,
             pub cone_axis: packed_half3,
             pub cone_cutoff: half::f16,
@@ -317,8 +319,11 @@ impl MeshletMesh {
         }
         macro_rules! filepath {
             ($p:literal) => {
-                concat!("/Users/pwong/projects/x-metal2/target/aarch64-apple-darwin/debug/ExampleApp.app/Contents/Resources/models/model/", $p)
-            }
+                concat!(
+                    "/Users/pwong/projects/x-metal2/assets/generated/models/bevy-bunny/",
+                    $p
+                )
+            };
         }
 
         write_file(filepath!("geometry.info"), &[self.metadata].into());
@@ -337,6 +342,13 @@ impl MeshletMesh {
                 .bounding_spheres
                 .iter()
                 .map(|b| MeshletBounds {
+                    // TODO(0): Temporarily identify the LOD Level 0 for basic testing in x-metal2
+                    lod_self_id: if b.self_lod.radius < f32::EPSILON {
+                        MESHLET_BOUNDS__ROOT_LOD_ID
+                    } else {
+                        0
+                    },
+                    lod_parent_id: MESHLET_BOUNDS__ROOT_LOD_ID,
                     center: b.self_culling.center.into(),
                     radius: half::f16::from_f32_const(b.self_culling.radius),
                     cone_apex: packed_half3::ZERO,
