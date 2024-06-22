@@ -5,7 +5,7 @@
 
 use bevy::{
     asset::io::file::FileAssetReader,
-    pbr::{experimental::meshlet::MeshletMesh, MinMax},
+    pbr::{experimental::meshlet::from_mesh_xmetal::MeshletMeshXMetal, MinMax},
     prelude::*,
     render::{
         mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
@@ -85,7 +85,7 @@ fn main() -> ExitCode {
     }
 
     println!(">>> Generating Meshlets...");
-    let meshlet_mesh = MeshletMesh::from_mesh(&m, position_denorm_scale).unwrap();
+    let meshlet_mesh = MeshletMeshXMetal::from_mesh(&m, position_denorm_scale).unwrap();
     println!(">>> Done!");
     println!(">>> Writing...");
     meshlet_mesh.export_for_xmetal();

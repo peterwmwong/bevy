@@ -3,6 +3,8 @@
 mod asset;
 #[cfg(feature = "meshlet_processor")]
 mod from_mesh;
+#[cfg(feature = "meshlet_processor")]
+pub mod from_mesh_xmetal;
 mod gpu_scene;
 mod material_draw_nodes;
 mod material_draw_prepare;
