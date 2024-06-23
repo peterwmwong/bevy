@@ -2,9 +2,9 @@
 
 mod asset;
 #[cfg(feature = "meshlet_processor")]
-mod from_mesh;
+mod export_meshlets_to_xmetal;
 #[cfg(feature = "meshlet_processor")]
-pub mod from_mesh_xmetal;
+mod from_mesh;
 mod gpu_scene;
 mod material_draw_nodes;
 mod material_draw_prepare;
@@ -13,6 +13,8 @@ mod persistent_buffer;
 mod persistent_buffer_impls;
 mod pipelines;
 mod visibility_buffer_raster_node;
+
+pub use export_meshlets_to_xmetal::export_meshlets_to_xmetal;
 
 pub mod graph {
     use bevy_render::render_graph::RenderLabel;

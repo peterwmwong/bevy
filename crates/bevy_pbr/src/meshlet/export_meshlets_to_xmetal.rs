@@ -1,7 +1,5 @@
 use super::{EncodedVertexPosition, ModelMetadata};
-use bevy_asset::Asset;
 use bevy_math::Vec3;
-use bevy_reflect::TypePath;
 use bevy_render::{
     mesh::{Indices, Mesh},
     render_resource::PrimitiveTopology,
@@ -16,107 +14,149 @@ use meshopt::{
 use metis::Graph;
 use std::{borrow::Cow, ops::Range, path::Path, sync::Arc};
 
-/// A mesh that has been pre-processed into multiple small clusters of triangles called meshlets.
+/// Process a [`Mesh`] to generate a [`MeshletMesh`].
 ///
-/// A [`bevy_render::mesh::Mesh`] can be converted to a [`MeshletMesh`] using `MeshletMesh::from_mesh` when the `meshlet_processor` cargo feature is enabled.
-/// The conversion step is very slow, and is meant to be ran once ahead of time, and not during runtime. This type of mesh is not suitable for
-/// dynamically generated geometry.
+/// This process is very slow, and should be done ahead of time, and not at runtime.
 ///
-/// There are restrictions on the [`crate::Material`] functionality that can be used with this type of mesh.
-/// * Materials have no control over the vertex shader or vertex attributes.
-/// * Materials must be opaque. Transparent, alpha masked, and transmissive materials are not supported.
-/// * Materials must use the [`crate::Material::meshlet_mesh_fragment_shader`] method (and similar variants for prepass/deferred shaders)
-///   which requires certain shader patterns that differ from the regular material shaders.
-/// * Limited control over [`bevy_render::render_resource::RenderPipelineDescriptor`] attributes.
+/// This function requires the `meshlet_processor` cargo feature.
 ///
-/// See also [`super::MaterialMeshletMeshBundle`] and [`super::MeshletPlugin`].
-#[derive(Asset, TypePath, Clone)]
-pub struct MeshletMeshXMetal {
-    pub vertex_positions: Arc<[EncodedVertexPosition]>,
-    pub denorm_scale: [f32; 3],
-    pub vertex_data: Arc<[u8]>,
-    pub meshlets: MeshletsExport,
-}
+/// The input mesh must:
+/// 1. Use [`PrimitiveTopology::TriangleList`]
+/// 2. Use indices
+/// 3. Have the exact following set of vertex attributes: `{POSITION, NORMAL, UV_0, TANGENT}`
+pub fn export_meshlets_to_xmetal(
+    mesh: &Mesh,
+    denorm_scale: [f32; 3],
+) -> Result<(), MeshToMeshletMeshConversionError> {
+    const POSITION_BYTE_OFFSET: usize = 0;
+    // Validate mesh format
+    let indices = validate_input_mesh(mesh)?;
 
-impl MeshletMeshXMetal {
-    /// Process a [`Mesh`] to generate a [`MeshletMesh`].
-    ///
-    /// This process is very slow, and should be done ahead of time, and not at runtime.
-    ///
-    /// This function requires the `meshlet_processor` cargo feature.
-    ///
-    /// The input mesh must:
-    /// 1. Use [`PrimitiveTopology::TriangleList`]
-    /// 2. Use indices
-    /// 3. Have the exact following set of vertex attributes: `{POSITION, NORMAL, UV_0, TANGENT}`
-    pub fn from_mesh(
-        mesh: &Mesh,
-        denorm_scale: [f32; 3],
-    ) -> Result<Self, MeshToMeshletMeshConversionError> {
-        const POSITION_BYTE_OFFSET: usize = 0;
-        // Validate mesh format
-        let indices = validate_input_mesh(mesh)?;
+    // Split the mesh into an initial list of meshlets (LOD 0)
+    let vertex_buffer = mesh.get_vertex_buffer_data();
+    let vertex_stride = mesh.get_vertex_size() as usize;
+    let vertices =
+        VertexDataAdapter::new(&vertex_buffer, vertex_stride, POSITION_BYTE_OFFSET).unwrap();
+    let mut lod_meshlets = LODMeshlets::new(compute_meshlets(&indices, &vertices));
 
-        // Split the mesh into an initial list of meshlets (LOD 0)
-        let vertex_buffer = mesh.get_vertex_buffer_data();
-        let vertex_stride = mesh.get_vertex_size() as usize;
-        let vertices =
-            VertexDataAdapter::new(&vertex_buffer, vertex_stride, POSITION_BYTE_OFFSET).unwrap();
-        let mut meshlets = MeshletsBuilder::new(compute_meshlets(&indices, &vertices));
+    // Convert meshopt_Meshlet data to a custom format
 
-        // Convert meshopt_Meshlet data to a custom format
+    // Build further LODs
+    let mut lod_level = 1;
+    let mut meshlets_to_simplify = 0..lod_meshlets.meshlets.len();
+    while meshlets_to_simplify.len() > 1 {
+        let groups = create_groups(meshlets_to_simplify.clone(), &lod_meshlets);
+        let next_meshlets_to_simplify_start = lod_meshlets.meshlets.len();
 
-        // Build further LODs
-        let mut lod_level = 1;
-        let mut meshlets_to_simplify = 0..meshlets.len();
-        while meshlets_to_simplify.len() > 1 {
-            let groups = create_groups(meshlets_to_simplify.clone(), &meshlets);
-            let next_meshlets_to_simplify_start = meshlets.len();
+        for group in groups.values().filter(|group| group.len() > 1) {
+            // Simplify the group to ~50% triangle count
+            let Some((group_vertex_indices, group_error)) =
+                simplify_meshlet_groups(group, &lod_meshlets, &vertices, lod_level)
+            else {
+                continue;
+            };
 
-            for group in groups.values().filter(|group| group.len() > 1) {
-                // Simplify the group to ~50% triangle count
-                let Some((group_vertex_indices, group_error)) =
-                    simplify_meshlet_groups(group, &meshlets, &vertices, lod_level)
-                else {
-                    continue;
-                };
-
-                // Build a new LOD bounding sphere for the simplified group as a whole
+            // Build a new LOD bounding sphere for the simplified group as a whole
+            let group_lod = Group {
                 // TODO(0): Replace `compute_cluster_bounds`/`meshopt_computeClusterBounds` with a
                 //          MUCH simpler and FASTER center calculation
                 // - meshopt_computeClusterBounds does a TON of unused calculations (radius, cone axis, cone apex, cone cutoff, etc.)
                 // - Radius is IGNORED!
                 // - Additionally, it CANNOT be inlined as it's an FFI call!
                 // - Write a small, inlineable function to do the "center of vertices" calculation
-                let group_lod = LOD {
-                    center: compute_cluster_bounds(&group_vertex_indices, &vertices)
-                        .center
-                        .into(),
-                    // Add the maximum child error to the parent error to make parent error cumulative from LOD 0
-                    // (we're currently building the parent from its children)
-                    error: group_error
+                center: compute_cluster_bounds(&group_vertex_indices, &vertices)
+                    .center
+                    .into(),
+                // Add the maximum child error to the parent error to make parent error cumulative from LOD 0
+                // (we're currently building the parent from its children)
+                error: group_error
+                        // TODO(0): Remove group_error from fold(), should be 0
+                        // - I think this is a subtle bug... since we're already adding group_error above
+                        // - I *think* this is trying to ensure higher LOD levels always have a 
+                        //   greater error
+                        // - Addding group_error (above), should do it no need to limit the minimum 
+                        //   error being added to group_error... to group_error
                         + group.iter().fold(group_error, |acc, &meshlet_id| {
-                            acc.max(meshlets.meshlet_self_lod_error(meshlet_id))
+                            acc.max(lod_meshlets.meshlet_group_error(meshlet_id))
                         }),
-                };
+            };
 
-                let lod_id = meshlets.add_lod(
-                    group_lod,
-                    // Build new meshlets using the simplified group
-                    &compute_meshlets(&group_vertex_indices, &vertices),
-                );
+            let lod_id = lod_meshlets.add_group(
+                group_lod,
+                // Build new meshlets using the simplified group
+                &compute_meshlets(&group_vertex_indices, &vertices),
+            );
 
-                // For each meshlet in the group set their parent LOD bounding sphere to that of the simplified group
-                meshlets.assign_parent_lod(lod_id, &group);
-            }
-
-            meshlets_to_simplify = next_meshlets_to_simplify_start..meshlets.len();
-            lod_level += 1;
+            // For each meshlet in the group set their parent LOD bounding sphere to that of the simplified group
+            lod_meshlets.assign_parent_group(lod_id, &group);
         }
 
+        meshlets_to_simplify = next_meshlets_to_simplify_start..lod_meshlets.meshlets.len();
+        lod_level += 1;
+    }
+
+    fn write_file<T: Copy + Clone>(path: impl AsRef<Path>, t: &Arc<[T]>) {
+        println!("- writing: {:?}", path.as_ref());
+        #[allow(unsafe_code)]
+        let a = unsafe {
+            core::slice::from_raw_parts(t.as_ptr() as *const _, core::mem::size_of::<T>() * t.len())
+        };
+        std::fs::write(path, a).unwrap();
+    }
+    macro_rules! filepath {
+        ($p:literal) => {
+            concat!(
+                "/Users/pwong/projects/x-metal2/assets/generated/models/bevy-bunny/",
+                $p
+            )
+        };
+    }
+    write_file(
+        filepath!("meshes.bin"),
+        &[MeshMaterials {
+            base_material_id: 0,
+            roughness_material_id: 0,
+            metalness_material_id: 0,
+            normal_material_id: 0,
+        }]
+        .into(),
+    );
+    write_file(
+        filepath!("m_mesh.bin"),
+        &core::iter::repeat(0)
+            .take(lod_meshlets.meshlets.len())
+            .collect::<Vec<u8>>()
+            .into(),
+    );
+    write_file(
+        filepath!("geometry.info"),
+        &[lod_meshlets.model_metadata(&vertices)].into(),
+    );
+    write_file(
+        filepath!("meshlets.bin"),
+        &lod_meshlets.generate_xmetal_meshlets(),
+    );
+    write_file(
+        filepath!("bounds.bin"),
+        &lod_meshlets.generate_meshlet_bounds(&vertices),
+    );
+    write_file(
+        filepath!("m_groups.bin"),
+        &lod_meshlets.meshlet_to_group_ids.into(),
+    );
+    write_file(
+        filepath!("m_index.bin"),
+        &lod_meshlets.meshlets.triangles.into(),
+    );
+    write_file(
+        filepath!("m_vertex.bin"),
+        &lod_meshlets.meshlets.vertices.into(),
+    );
+
+    {
+        let vertex_count = vertex_buffer.len() / vertex_stride;
         #[allow(unsafe_code)]
         let vertex_positions: Vec<EncodedVertexPosition> = unsafe {
-            let vertex_count = vertex_buffer.len() / vertex_stride;
             let start = vertex_buffer.as_ptr().byte_add(POSITION_BYTE_OFFSET);
             (0..vertex_count)
                 .map(|i| {
@@ -127,98 +167,26 @@ impl MeshletMeshXMetal {
                 })
                 .collect()
         };
+        write_file(filepath!("vertex_p.bin"), &vertex_positions.into());
 
-        Ok(Self {
-            denorm_scale,
-            meshlets: meshlets.export(&vertices),
-            vertex_data: vertex_buffer.into(),
-            vertex_positions: vertex_positions.into(),
-        })
-    }
-
-    pub fn export_for_xmetal(&self) {
         #[repr(C)]
-        #[derive(Copy, Clone, PartialEq)]
-        pub struct Mesh {
-            pub base_material_id: ::std::os::raw::c_uchar,
-            pub roughness_material_id: ::std::os::raw::c_uchar,
-            pub metalness_material_id: ::std::os::raw::c_uchar,
-            pub normal_material_id: ::std::os::raw::c_uchar,
+        #[derive(Copy, Clone, PartialEq, Default)]
+        pub struct EncodedVertex {
+            pub positionxy: ::std::os::raw::c_uint,
+            pub positionz_n1: ::std::os::raw::c_uint,
+            pub n0_tangent_mikkt: ::std::os::raw::c_uint,
+            pub tx_coord: ::std::os::raw::c_uint,
         }
-
-        fn write_file<T: Copy + Clone>(path: impl AsRef<Path>, t: &Arc<[T]>) {
-            println!("- writing: {:?}", path.as_ref());
-            #[allow(unsafe_code)]
-            let a = unsafe {
-                core::slice::from_raw_parts(
-                    t.as_ptr() as *const _,
-                    core::mem::size_of::<T>() * t.len(),
-                )
-            };
-            std::fs::write(path, a).unwrap();
-        }
-        macro_rules! filepath {
-            ($p:literal) => {
-                concat!(
-                    "/Users/pwong/projects/x-metal2/assets/generated/models/bevy-bunny/",
-                    $p
-                )
-            };
-        }
-
-        write_file(filepath!("geometry.info"), &[self.meshlets.metadata].into());
-        write_file(filepath!("meshlets.bin"), &self.meshlets.meshlets);
-        write_file(filepath!("bounds.bin"), &self.meshlets.meshlet_bounds);
-        write_file(filepath!("lod_refs.bin"), &self.meshlets.meshlet_lod_refs);
-        write_file(filepath!("m_index.bin"), &self.meshlets.indices);
-        write_file(filepath!("m_vertex.bin"), &self.meshlets.vertex_ids);
-        write_file(filepath!("vertex_p.bin"), &self.vertex_positions);
-        write_file(filepath!("meshes_ds.bin"), &[self.denorm_scale].into());
-        write_file(
-            filepath!("m_mesh.bin"),
-            &core::iter::repeat(0)
-                .take(self.meshlets.meshlets.len())
-                .collect::<Vec<u8>>()
-                .into(),
-        );
-        write_file(
-            filepath!("meshes.bin"),
-            &[Mesh {
-                base_material_id: 0,
-                roughness_material_id: 0,
-                metalness_material_id: 0,
-                normal_material_id: 0,
-            }]
-            .into(),
-        );
-        // TODO(0): Implement vertices
-        {
-            #[repr(C)]
-            #[derive(Copy, Clone, PartialEq)]
-            pub struct EncodedVertex {
-                pub positionxy: ::std::os::raw::c_uint,
-                pub positionz_n1: ::std::os::raw::c_uint,
-                pub n0_tangent_mikkt: ::std::os::raw::c_uint,
-                pub tx_coord: ::std::os::raw::c_uint,
-            }
-            let vertices: Arc<[EncodedVertex]> = core::iter::repeat(0)
-                .take(self.vertex_positions.len())
-                .map(|_| EncodedVertex {
-                    positionxy: 0,
-                    positionz_n1: 0,
-                    n0_tangent_mikkt: 0,
-                    tx_coord: 0,
-                })
-                .collect::<Vec<EncodedVertex>>()
-                .into();
-            write_file(filepath!("vertex.bin"), &vertices);
-        }
-    }
+        let vertices: Arc<[EncodedVertex]> = (vec![EncodedVertex::default(); vertex_count]).into();
+        write_file(filepath!("vertex.bin"), &vertices);
+    };
+    write_file(filepath!("meshes_ds.bin"), &[denorm_scale].into());
+    Ok(())
 }
 
 // TODO(0): Optimize with normaliztion/quantization
 #[derive(Copy, Clone, PartialEq, Default)]
-pub struct LOD {
+struct Group {
     pub center: Vec3,
     pub error: f32,
 }
@@ -226,7 +194,7 @@ pub struct LOD {
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq)]
-pub struct packed_half3 {
+struct packed_half3 {
     pub xyz: [half::f16; 3],
 }
 
@@ -251,128 +219,120 @@ impl From<[f32; 3]> for packed_half3 {
         }
     }
 }
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq)]
+struct MeshMaterials {
+    pub base_material_id: ::std::os::raw::c_uchar,
+    pub roughness_material_id: ::std::os::raw::c_uchar,
+    pub metalness_material_id: ::std::os::raw::c_uchar,
+    pub normal_material_id: ::std::os::raw::c_uchar,
+}
 
 #[derive(Clone, Copy)]
-pub struct MeshletLODRefs {
-    pub self_lod: u16,
-    pub parent_lod: u16,
+struct MeshletGroups {
+    pub group_id: u16,
+    pub parent_group_id: u16,
 }
 
-impl MeshletLODRefs {
-    pub const LOD_ROOT_ID: u16 = u16::MAX;
+impl MeshletGroups {
+    pub const NO_GROUP_ID: u16 = u16::MAX;
 }
 
-#[derive(Clone)]
-pub struct MeshletsExport {
-    metadata: ModelMetadata,
-    indices: Arc<[u8]>,
-    vertex_ids: Arc<[u32]>,
-    meshlets: Arc<[Meshlet]>,
-    meshlet_bounds: Arc<[MeshletBounds]>,
-    meshlet_lod_refs: Arc<[MeshletLODRefs]>,
-    // TODO(0): START HERE - Write/test LODs
-    lods: Arc<[LOD]>,
-}
-
-pub struct MeshletsBuilder {
+struct LODMeshlets {
     meshlets: Meshlets,
-    meshlet_lod_refs: Vec<MeshletLODRefs>,
-    lods: Vec<LOD>,
+    meshlet_to_group_ids: Vec<MeshletGroups>,
+    groups: Vec<Group>,
 }
 
-impl MeshletsBuilder {
-    fn new(meshlets: Meshlets) -> Self {
+impl LODMeshlets {
+    fn new(lod_0_meshlets: Meshlets) -> Self {
         Self {
-            lods: vec![],
-            meshlet_lod_refs: (0..meshlets.meshlets.len())
+            groups: vec![],
+            meshlet_to_group_ids: (0..lod_0_meshlets.meshlets.len())
                 .into_iter()
-                .map(|_| MeshletLODRefs {
-                    parent_lod: MeshletLODRefs::LOD_ROOT_ID,
-                    self_lod: MeshletLODRefs::LOD_ROOT_ID,
+                .map(|_| MeshletGroups {
+                    parent_group_id: MeshletGroups::NO_GROUP_ID,
+                    group_id: MeshletGroups::NO_GROUP_ID,
                 })
                 .collect(),
-            meshlets,
+            meshlets: lod_0_meshlets,
         }
     }
 
-    fn assign_parent_lod(&mut self, parent_lod_id: u16, meshlet_ids: &[usize]) {
+    fn assign_parent_group(&mut self, parent_group_id: u16, meshlet_ids: &[usize]) {
         for &m in meshlet_ids {
-            self.meshlet_lod_refs[m].parent_lod = parent_lod_id;
+            self.meshlet_to_group_ids[m].parent_group_id = parent_group_id;
         }
     }
 
-    fn add_lod(&mut self, lod: LOD, other: &Meshlets) -> u16 {
+    fn add_group(&mut self, group: Group, group_meshlets: &Meshlets) -> u16 {
         let vertex_offset = self.meshlets.vertices.len() as u32;
         let triangle_offset = self.meshlets.triangles.len() as u32;
 
-        self.meshlets.vertices.extend_from_slice(&other.vertices);
-        self.meshlets.triangles.extend_from_slice(&other.triangles);
+        self.meshlets
+            .vertices
+            .extend_from_slice(&group_meshlets.vertices);
+        self.meshlets
+            .triangles
+            .extend_from_slice(&group_meshlets.triangles);
 
         self.meshlets
             .meshlets
-            .extend(other.meshlets.iter().map(|m| meshopt_Meshlet {
+            .extend(group_meshlets.meshlets.iter().map(|m| meshopt_Meshlet {
                 vertex_offset: m.vertex_offset + vertex_offset,
                 triangle_offset: m.triangle_offset + triangle_offset,
                 vertex_count: m.vertex_count,
                 triangle_count: m.triangle_count,
             }));
 
-        let self_lod = self.lods.len();
-        assert!(self_lod < (u16::MAX as usize));
-        let self_lod = self_lod as u16;
-        self.lods.push(lod);
+        let group_id = self.groups.len();
+        assert!(group_id < (u16::MAX as usize));
+        let group_id = group_id as u16;
+        self.groups.push(group);
 
-        self.meshlet_lod_refs
-            .extend(
-                (0..other.meshlets.len())
-                    .into_iter()
-                    .map(|_| MeshletLODRefs {
-                        parent_lod: MeshletLODRefs::LOD_ROOT_ID,
-                        self_lod,
-                    }),
-            );
-        self_lod
+        self.meshlet_to_group_ids.extend_from_slice(&vec![
+            MeshletGroups {
+                parent_group_id: MeshletGroups::NO_GROUP_ID,
+                group_id,
+            };
+            group_meshlets.meshlets.len()
+        ]);
+        group_id
     }
 
-    fn meshlet_self_lod_error(&self, meshlet_id: usize) -> f32 {
-        let self_lod = self.meshlet_lod_refs[meshlet_id].self_lod;
-        if self_lod == MeshletLODRefs::LOD_ROOT_ID {
+    fn meshlet_group_error(&self, meshlet_id: usize) -> f32 {
+        let self_lod = self.meshlet_to_group_ids[meshlet_id].group_id;
+        if self_lod == MeshletGroups::NO_GROUP_ID {
             0.
         } else {
-            self.lods[self_lod as usize].error
+            self.groups[self_lod as usize].error
         }
     }
 
-    fn len(&self) -> usize {
-        self.meshlets.len()
+    fn generate_meshlet_bounds(&self, vertices: &VertexDataAdapter) -> Arc<[MeshletBounds]> {
+        self.meshlets
+            .iter()
+            .map(|m| compute_meshlet_bounds(m, vertices).into())
+            .collect::<Vec<MeshletBounds>>()
+            .into()
     }
 
-    fn export(self, vertices: &VertexDataAdapter) -> MeshletsExport {
-        MeshletsExport {
-            metadata: ModelMetadata {
-                meshes_len: 1,
-                meshlets_len: self.meshlets.len() as _,
-                meshlet_indices_len: self.meshlets.triangles.len() as _,
-                meshlet_vertices_len: self.meshlets.vertices.len() as _,
-                vertices_len: vertices.vertex_count as _,
-            },
-            meshlet_bounds: self
-                .meshlets
-                .iter()
-                .map(|m| compute_meshlet_bounds(m, vertices).into())
-                .collect::<Vec<MeshletBounds>>()
-                .into(),
-            indices: self.meshlets.triangles.into(),
-            vertex_ids: self.meshlets.vertices.into(),
-            meshlets: self
-                .meshlets
-                .meshlets
-                .into_iter()
-                .map(|m| Meshlet::new(m.triangle_offset, m.triangle_count, m.vertex_offset))
-                .collect::<Vec<Meshlet>>()
-                .into(),
-            meshlet_lod_refs: self.meshlet_lod_refs.into(),
-            lods: self.lods.into(),
+    fn generate_xmetal_meshlets(&self) -> Arc<[Meshlet]> {
+        self.meshlets
+            .meshlets
+            .iter()
+            .map(|m| Meshlet::new(m.triangle_offset, m.triangle_count, m.vertex_offset))
+            .collect::<Vec<Meshlet>>()
+            .into()
+    }
+
+    fn model_metadata(&self, vertices: &VertexDataAdapter) -> ModelMetadata {
+        ModelMetadata {
+            meshes_len: 1,
+            meshlets_len: self.meshlets.len() as _,
+            meshlet_indices_len: self.meshlets.triangles.len() as _,
+            meshlet_vertices_len: self.meshlets.vertices.len() as _,
+            vertices_len: vertices.vertex_count as _,
         }
     }
 }
@@ -412,35 +372,16 @@ impl Meshlet {
             _vertices_start: vertices_start,
         }
     }
-
-    // #[cfg(debug_assertions)]
-    // pub fn indices_start(&self) -> u32 {
-    //     (self.raw >> MESHLET_TRIANGLE_COUNT_NUM_BITS) << MESHLET_INDEX_ALIGNMENT_POW_2
-    // }
-    // #[cfg(debug_assertions)]
-    // pub fn vertices_start(&self) -> u32 {
-    //     self._vertices_start
-    // }
-    // #[cfg(debug_assertions)]
-    // pub fn triangle_count(&self) -> u32 {
-    //     (self.raw & ((1 << MESHLET_TRIANGLE_COUNT_NUM_BITS) - 1)) + 1
-    // }
-    // // TODO(1): Move helper into a more relevant place, like a new MeshIndices(Vec<MeshletIndexType>).
-    // #[inline(always)]
-    // pub(crate) fn indices_padding(index_count: u32) -> u32 {
-    //     MESHLET_INDEX_ALIGNMENT_MASK
-    //         & (MESHLET_INDEX_ALIGNMENT - (MESHLET_INDEX_ALIGNMENT_MASK & index_count))
-    // }
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq)]
-pub struct MeshletBounds {
-    pub cone_apex: packed_half3,
-    pub cone_axis: packed_half3,
-    pub cone_cutoff: half::f16,
-    pub center: packed_half3,
-    pub radius: half::f16,
+struct MeshletBounds {
+    cone_apex: packed_half3,
+    cone_axis: packed_half3,
+    cone_cutoff: half::f16,
+    center: packed_half3,
+    radius: half::f16,
 }
 
 impl From<meshopt_Bounds> for MeshletBounds {
@@ -457,7 +398,7 @@ impl From<meshopt_Bounds> for MeshletBounds {
 
 fn create_groups(
     meshlets_to_simplify: Range<usize>,
-    meshlets: &MeshletsBuilder,
+    meshlets: &LODMeshlets,
 ) -> bevy_utils::hashbrown::HashMap<i32, Vec<usize>> {
     // For each meshlet build a set of triangle edges
     let triangle_edges_per_meshlet =
@@ -518,7 +459,7 @@ fn compute_meshlets(indices: &[u32], vertices: &VertexDataAdapter) -> Meshlets {
 
 fn collect_triangle_edges_per_meshlet(
     simplification_queue: Range<usize>,
-    meshlets: &MeshletsBuilder,
+    meshlets: &LODMeshlets,
 ) -> HashMap<usize, HashSet<(u32, u32)>> {
     let mut triangle_edges_per_meshlet = HashMap::new();
     for meshlet_id in simplification_queue {
@@ -603,7 +544,7 @@ fn group_meshlets(
 
 fn simplify_meshlet_groups(
     group_meshlets: &[usize],
-    meshlets: &MeshletsBuilder,
+    meshlets: &LODMeshlets,
     vertices: &VertexDataAdapter<'_>,
     lod_level: u32,
 ) -> Option<(Vec<u32>, f32)> {
