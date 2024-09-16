@@ -159,13 +159,9 @@ impl MeshletMesh {
         }
 
         Ok(Self {
-            metadata: ModelMetadata {
-                meshes_len: 1,
-                meshlets_len: meshlets.len() as _,
-                meshlet_indices_len: meshlets.triangles.len() as _,
-                meshlet_vertices_len: meshlets.vertices.len() as _,
-                vertices_len: vertex_positions.len() as _,
-            },
+            metadata: todo!(
+                "Remove x-metal changes, everything x-metal moved into export_meshlets_to_xmetal"
+            ),
             worst_case_meshlet_triangles,
             denorm_scale,
             vertex_data: vertex_buffer.into(),

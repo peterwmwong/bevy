@@ -6,9 +6,9 @@ use bevy_asset::{
 use bevy_math::Vec3;
 use bevy_reflect::TypePath;
 use bytemuck::{Pod, Zeroable};
-use lz4_flex::frame::{FrameDecoder, FrameEncoder};
+use lz4_flex::frame::FrameEncoder;
 use serde::{Deserialize, Serialize};
-use std::{io::Cursor, sync::Arc};
+use std::sync::Arc;
 
 /// The current version of the [`MeshletMesh`] asset format.
 pub const MESHLET_MESH_ASSET_VERSION: u64 = 0;
@@ -34,6 +34,7 @@ impl EncodedVertexPosition {
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub struct ModelMetadata {
     pub(crate) meshes_len: u32,
+    pub(crate) lod_groups_len: u32,
     pub(crate) meshlets_len: u32,
     // TODO(0): Replace indices_len with triangle_count to save 1.5 bits (or increase
     //          amount by 3x).

@@ -42,7 +42,7 @@ pub fn export_meshlets_to_xmetal(
     // Convert meshopt_Meshlet data to a custom format
 
     // Build further LODs
-    let mut lod_level = 1;
+    let mut lod_level: u8 = 0;
     let mut meshlets_to_simplify = 0..lod_meshlets.meshlets.len();
     while meshlets_to_simplify.len() > 1 {
         let groups = create_groups(meshlets_to_simplify.clone(), &lod_meshlets);
@@ -57,34 +57,33 @@ pub fn export_meshlets_to_xmetal(
             };
 
             // Build a new LOD bounding sphere for the simplified group as a whole
-            let group_lod = Group {
-                // TODO(0): Replace `compute_cluster_bounds`/`meshopt_computeClusterBounds` with a
-                //          MUCH simpler and FASTER center calculation
-                // - meshopt_computeClusterBounds does a TON of unused calculations (radius, cone axis, cone apex, cone cutoff, etc.)
-                // - Radius is IGNORED!
-                // - Additionally, it CANNOT be inlined as it's an FFI call!
-                // - Write a small, inlineable function to do the "center of vertices" calculation
-                center: compute_cluster_bounds(&group_vertex_indices, &vertices)
-                    .center
-                    .into(),
-                // Add the maximum child error to the parent error to make parent error cumulative from LOD 0
-                // (we're currently building the parent from its children)
-                error: group_error
-                        // TODO(0): Remove group_error from fold(), should be 0
-                        // - I think this is a subtle bug... since we're already adding group_error above
-                        // - I *think* this is trying to ensure higher LOD levels always have a 
-                        //   greater error
-                        // - Addding group_error (above), should do it no need to limit the minimum 
-                        //   error being added to group_error... to group_error
-                        + group.iter().fold(group_error, |acc, &meshlet_id| {
-                            acc.max(lod_meshlets.meshlet_group_error(meshlet_id))
-                        }),
-            };
-
             let lod_id = lod_meshlets.add_group(
-                group_lod,
+                Group {
+                    // TODO(0): Replace `compute_cluster_bounds`/`meshopt_computeClusterBounds` with a
+                    //          MUCH simpler and FASTER center calculation
+                    // - meshopt_computeClusterBounds does a TON of unused calculations (radius, cone axis, cone apex, cone cutoff, etc.)
+                    // - Radius is IGNORED!
+                    // - Additionally, it CANNOT be inlined as it's an FFI call!
+                    // - Write a small, inlineable function to do the "center of vertices" calculation
+                    center: compute_cluster_bounds(&group_vertex_indices, &vertices)
+                        .center
+                        .into(),
+                    // Add the maximum child error to the parent error to make parent error cumulative from LOD 0
+                    // (we're currently building the parent from its children)
+                    error: group_error
+                            // TODO(0): Remove group_error from fold(), should be 0
+                            // - I think this is a subtle bug... since we're already adding group_error above
+                            // - I *think* this is trying to ensure higher LOD levels always have a 
+                            //   greater error
+                            // - Addding group_error (above), should do it no need to limit the minimum 
+                            //   error being added to group_error... to group_error
+                            + group.iter().fold(group_error, |acc, &meshlet_id| {
+                                acc.max(lod_meshlets.meshlet_group_error(meshlet_id))
+                            }),
+                },
                 // Build new meshlets using the simplified group
                 &compute_meshlets(&group_vertex_indices, &vertices),
+                lod_level,
             );
 
             // For each meshlet in the group set their parent LOD bounding sphere to that of the simplified group
@@ -94,6 +93,8 @@ pub fn export_meshlets_to_xmetal(
         meshlets_to_simplify = next_meshlets_to_simplify_start..lod_meshlets.meshlets.len();
         lod_level += 1;
     }
+
+    dbg!(lod_meshlets.meshlets.len());
 
     fn write_file<T: Copy + Clone>(path: impl AsRef<Path>, t: &Arc<[T]>) {
         println!("- writing: {:?}", path.as_ref());
@@ -111,6 +112,7 @@ pub fn export_meshlets_to_xmetal(
             )
         };
     }
+    let _ = std::fs::create_dir(filepath!(""));
     write_file(
         filepath!("meshes.bin"),
         &[MeshMaterials {
@@ -144,6 +146,11 @@ pub fn export_meshlets_to_xmetal(
         filepath!("m_groups.bin"),
         &lod_meshlets.meshlet_to_group_ids.into(),
     );
+    for group in &mut lod_meshlets.groups {
+        // Optimization Precalculate: Runtime LOD selection only uses the error squared.
+        group.error = group.error * group.error;
+    }
+    write_file(filepath!("lod_groups.bin"), &lod_meshlets.groups.into());
     write_file(
         filepath!("m_index.bin"),
         &lod_meshlets.meshlets.triangles.into(),
@@ -151,6 +158,15 @@ pub fn export_meshlets_to_xmetal(
     write_file(
         filepath!("m_vertex.bin"),
         &lod_meshlets.meshlets.vertices.into(),
+    );
+    let max_lod_level = lod_level - 1;
+    println!("max lod level= {}", max_lod_level);
+    lod_meshlets
+        .dbg_meshlet_to_lod_level
+        .insert(0, max_lod_level);
+    write_file(
+        filepath!("dbg_m_lods.bin"),
+        &lod_meshlets.dbg_meshlet_to_lod_level.into(),
     );
 
     {
@@ -239,22 +255,25 @@ impl MeshletGroups {
 }
 
 struct LODMeshlets {
-    meshlets: Meshlets,
+    pub meshlets: Meshlets,
     meshlet_to_group_ids: Vec<MeshletGroups>,
     groups: Vec<Group>,
+    dbg_meshlet_to_lod_level: Vec<u8>,
 }
 
 impl LODMeshlets {
     fn new(lod_0_meshlets: Meshlets) -> Self {
         Self {
             groups: vec![],
-            meshlet_to_group_ids: (0..lod_0_meshlets.meshlets.len())
-                .into_iter()
+            meshlet_to_group_ids: lod_0_meshlets
+                .meshlets
+                .iter()
                 .map(|_| MeshletGroups {
                     parent_group_id: MeshletGroups::NO_GROUP_ID,
                     group_id: MeshletGroups::NO_GROUP_ID,
                 })
                 .collect(),
+            dbg_meshlet_to_lod_level: vec![0; lod_0_meshlets.len()],
             meshlets: lod_0_meshlets,
         }
     }
@@ -265,7 +284,7 @@ impl LODMeshlets {
         }
     }
 
-    fn add_group(&mut self, group: Group, group_meshlets: &Meshlets) -> u16 {
+    fn add_group(&mut self, group: Group, group_meshlets: &Meshlets, dbg_lod_level: u8) -> u16 {
         let vertex_offset = self.meshlets.vertices.len() as u32;
         let triangle_offset = self.meshlets.triangles.len() as u32;
 
@@ -297,6 +316,8 @@ impl LODMeshlets {
             };
             group_meshlets.meshlets.len()
         ]);
+        self.dbg_meshlet_to_lod_level
+            .extend_from_slice(&vec![dbg_lod_level; group_meshlets.meshlets.len()]);
         group_id
     }
 
@@ -321,7 +342,14 @@ impl LODMeshlets {
         self.meshlets
             .meshlets
             .iter()
-            .map(|m| Meshlet::new(m.triangle_offset, m.triangle_count, m.vertex_offset))
+            .map(|m| {
+                Meshlet::new(
+                    m.triangle_offset,
+                    m.triangle_count,
+                    m.vertex_offset,
+                    m.vertex_count,
+                )
+            })
             .collect::<Vec<Meshlet>>()
             .into()
     }
@@ -329,6 +357,7 @@ impl LODMeshlets {
     fn model_metadata(&self, vertices: &VertexDataAdapter) -> ModelMetadata {
         ModelMetadata {
             meshes_len: 1,
+            lod_groups_len: self.groups.len() as _,
             meshlets_len: self.meshlets.len() as _,
             meshlet_indices_len: self.meshlets.triangles.len() as _,
             meshlet_vertices_len: self.meshlets.vertices.len() as _,
@@ -340,37 +369,69 @@ impl LODMeshlets {
 pub const MESHLET_TRIANGLE_COUNT_NUM_BITS: ::std::os::raw::c_uint = 8;
 pub const MESHLET_INDICES_NUM_BITS: ::std::os::raw::c_uint = 24;
 pub const MESHLET_INDEX_ALIGNMENT_POW_2: ::std::os::raw::c_uint = 2;
-const MESHLET_INDEX_ALIGNMENT: u32 = 1 << MESHLET_INDEX_ALIGNMENT_POW_2;
-const MESHLET_INDEX_ALIGNMENT_MASK: u32 = MESHLET_INDEX_ALIGNMENT - 1;
+pub const MESHLET_VERTEX_COUNT_NUM_BITS: ::std::os::raw::c_uint = 8;
+pub const MESHLET_VERTEX_START_NUM_BITS: ::std::os::raw::c_uint = 24;
+
+const MESHLET_VERTEX_COUNT_MASK: u32 = (1 << MESHLET_VERTEX_COUNT_NUM_BITS) - 1;
+const MESHLET_TRIANGLE_COUNT_MASK: u32 = (1 << MESHLET_TRIANGLE_COUNT_NUM_BITS) - 1;
 
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq)]
 pub struct Meshlet {
     pub raw: u32,
-    pub _vertices_start: u32,
+    pub _vertices: u32,
 }
+
 impl Meshlet {
     #[inline]
-    pub(crate) fn new(indices_start: u32, triangle_count: u32, vertices_start: u32) -> Self {
+    pub(crate) fn new(
+        indices_start: u32,
+        triangle_count: u32,
+        vertices_start: u32,
+        vertices_count: u32,
+    ) -> Self {
+        const MAX_INDICES_START: u32 = (1 << MESHLET_INDICES_NUM_BITS) - 1;
         assert!(
-            indices_start < ((1 << MESHLET_INDICES_NUM_BITS) << MESHLET_INDEX_ALIGNMENT_POW_2),
-            "indices_start={indices_start} triangle_count={triangle_count}"
-        );
-        assert_eq!(
-            indices_start & MESHLET_INDEX_ALIGNMENT_MASK,
-            0,
-            "indices_start={indices_start} triangle_count={triangle_count}"
+            indices_start <= MAX_INDICES_START,
+            "indices_start ({indices_start}) must be <= {MAX_INDICES_START}"
         );
         assert!(
-            triangle_count > 0 && (triangle_count - 1) < (1 << MESHLET_TRIANGLE_COUNT_NUM_BITS),
-            "indices_start={indices_start} triangle_count={triangle_count}"
+            (1..=MESHLET_VERTEX_COUNT_MASK).contains(&triangle_count),
+            "triangle_count ({triangle_count}) must be within 1..={MESHLET_VERTEX_COUNT_MASK}"
+        );
+        const MAX_VERTICES_START: u32 = (1 << MESHLET_VERTEX_START_NUM_BITS) - 1;
+        assert!(
+            vertices_start <= MAX_VERTICES_START,
+            "vertices_start ({vertices_start}) must be <= {MAX_VERTICES_START}"
+        );
+        assert!(
+            (1..=MESHLET_TRIANGLE_COUNT_MASK).contains(&vertices_count),
+            "vertices_count ({vertices_count}) must be within 1..={MESHLET_TRIANGLE_COUNT_MASK}"
         );
         Self {
-            raw: ((indices_start >> MESHLET_INDEX_ALIGNMENT_POW_2)
-                << MESHLET_TRIANGLE_COUNT_NUM_BITS)
-                | ((triangle_count - 1) as u32),
-            _vertices_start: vertices_start,
+            raw: ((indices_start << MESHLET_TRIANGLE_COUNT_NUM_BITS) | triangle_count),
+            _vertices: ((vertices_start << MESHLET_VERTEX_COUNT_NUM_BITS) | vertices_count),
         }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn indices_start(&self) -> u32 {
+        self.raw >> MESHLET_TRIANGLE_COUNT_NUM_BITS
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn vertices_start(&self) -> u32 {
+        self._vertices >> MESHLET_VERTEX_COUNT_NUM_BITS
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn vertices_count(&self) -> u32 {
+        self._vertices & MESHLET_VERTEX_COUNT_MASK
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn triangle_count(&self) -> u32 {
+        self.raw & ((1 << MESHLET_TRIANGLE_COUNT_NUM_BITS) - 1)
     }
 }
 
@@ -388,10 +449,10 @@ impl From<meshopt_Bounds> for MeshletBounds {
     fn from(b: meshopt_Bounds) -> Self {
         MeshletBounds {
             center: b.center.into(),
+            cone_apex: b.cone_apex.into(),
+            cone_axis: b.cone_axis.into(),
+            cone_cutoff: half::f16::from_f32_const(b.cone_cutoff),
             radius: half::f16::from_f32_const(b.radius),
-            cone_apex: packed_half3::ZERO,
-            cone_axis: packed_half3::ZERO,
-            cone_cutoff: half::f16::from_f32_const(1.),
         }
     }
 }
@@ -440,6 +501,13 @@ fn validate_input_mesh(mesh: &Mesh) -> Result<Cow<'_, [u32]>, MeshToMeshletMeshC
 
 fn compute_meshlets(indices: &[u32], vertices: &VertexDataAdapter) -> Meshlets {
     let mut meshlets = build_meshlets(indices, vertices, 64, 96, 0.0);
+    let last_meshlet = &meshlets.meshlets[meshlets.meshlets.len() - 1];
+    meshlets
+        .vertices
+        .truncate((last_meshlet.vertex_offset + last_meshlet.vertex_count) as usize);
+    meshlets
+        .triangles
+        .truncate((last_meshlet.triangle_offset + last_meshlet.triangle_count * 3) as usize);
 
     for meshlet in &mut meshlets.meshlets {
         #[allow(unsafe_code)]
@@ -546,7 +614,7 @@ fn simplify_meshlet_groups(
     group_meshlets: &[usize],
     meshlets: &LODMeshlets,
     vertices: &VertexDataAdapter<'_>,
-    lod_level: u32,
+    lod_level: u8,
 ) -> Option<(Vec<u32>, f32)> {
     // Build a new index buffer into the mesh vertex data by combining all meshlet data in the group
     let mut group_indices = Vec::new();
@@ -558,7 +626,7 @@ fn simplify_meshlet_groups(
     }
 
     // Allow more deformation for high LOD levels (1% at LOD 1, 10% at LOD 20+)
-    let t = (lod_level - 1) as f32 / 19.0;
+    let t = (lod_level as f32) / 19.0;
     let target_error = 0.1 * t + 0.01 * (1.0 - t);
 
     // Simplify the group to ~50% triangle count
