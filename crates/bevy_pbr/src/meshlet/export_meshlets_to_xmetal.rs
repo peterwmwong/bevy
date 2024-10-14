@@ -70,19 +70,14 @@ pub fn export_meshlets_to_xmetal(
                         .into(),
                     // Add the maximum child error to the parent error to make parent error cumulative from LOD 0
                     // (we're currently building the parent from its children)
+                    // TODO(0): Remove `group_error +`, see bevy change: https://github.com/bevyengine/bevy/pull/15023
                     error: group_error
-                            // TODO(0): Remove group_error from fold(), should be 0
-                            // - I think this is a subtle bug... since we're already adding group_error above
-                            // - I *think* this is trying to ensure higher LOD levels always have a 
-                            //   greater error
-                            // - Addding group_error (above), should do it no need to limit the minimum 
-                            //   error being added to group_error... to group_error
-                            + group.iter().fold(group_error, |acc, &meshlet_id| {
-                                acc.max(lod_meshlets.meshlet_group_error(meshlet_id))
-                            }),
+                        + group.iter().fold(group_error, |acc, &meshlet_id| {
+                            acc.max(lod_meshlets.meshlet_group_error(meshlet_id))
+                        }),
                 },
                 // Build new meshlets using the simplified group
-                &compute_meshlets(&group_vertex_indices, &vertices),
+                compute_meshlets(&group_vertex_indices, &vertices),
                 lod_level,
             );
 
@@ -150,6 +145,7 @@ pub fn export_meshlets_to_xmetal(
         // Optimization Precalculate: Runtime LOD selection only uses the error squared.
         group.error = group.error * group.error;
     }
+    println!("num lod groups= {}", lod_meshlets.groups.len());
     write_file(filepath!("lod_groups.bin"), &lod_meshlets.groups.into());
     write_file(
         filepath!("m_index.bin"),
@@ -169,7 +165,11 @@ pub fn export_meshlets_to_xmetal(
         &lod_meshlets.dbg_meshlet_to_lod_level.into(),
     );
 
+    // TODO(0): Add generating meshes_sbr.bin see `tmp_generate_meshes_sphere_bounds_radius()` on
+    // `select_meshlets-remove-threadgroup-mem` branch
+
     {
+        let mut max_sphere_bounds_radius = f32::MIN;
         let vertex_count = vertex_buffer.len() / vertex_stride;
         #[allow(unsafe_code)]
         let vertex_positions: Vec<EncodedVertexPosition> = unsafe {
@@ -177,6 +177,8 @@ pub fn export_meshlets_to_xmetal(
             (0..vertex_count)
                 .map(|i| {
                     let p: [f32; 3] = *(start.byte_add(i * vertex_stride) as *const [f32; 3]);
+                    max_sphere_bounds_radius = max_sphere_bounds_radius
+                        .max((p[0].powi(2) + p[1].powi(2) + p[2].powi(2)).sqrt());
                     let p_norm: [f32; 3] = core::array::from_fn(|i| p[i] / denorm_scale[i]);
                     let p_quant = EncodedVertexPosition::from_f32(&p_norm);
                     p_quant
@@ -195,6 +197,11 @@ pub fn export_meshlets_to_xmetal(
         }
         let vertices: Arc<[EncodedVertex]> = (vec![EncodedVertex::default(); vertex_count]).into();
         write_file(filepath!("vertex.bin"), &vertices);
+
+        write_file(
+            filepath!("meshes_sbr.bin"),
+            &[max_sphere_bounds_radius].into(),
+        );
     };
     write_file(filepath!("meshes_ds.bin"), &[denorm_scale].into());
     Ok(())
@@ -254,15 +261,80 @@ impl MeshletGroups {
     pub const NO_GROUP_ID: u16 = u16::MAX;
 }
 
+struct XMetal2Meshlets {
+    pub meshlets: Vec<meshopt_Meshlet>,
+    pub vertices: Vec<u32>,
+    pub triangles: Vec<[u8; 3]>,
+}
+
+impl XMetal2Meshlets {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.meshlets.len()
+    }
+
+    fn meshlet_from_ffi<'a>(
+        &'a self,
+        meshlet: &meshopt::ffi::meshopt_Meshlet,
+    ) -> meshopt::Meshlet<'a> {
+        #[allow(unsafe_code)]
+        let triangles: &'a [u8] = unsafe {
+            core::slice::from_raw_parts(
+                self.triangles[meshlet.triangle_offset as usize].as_ptr(),
+                (meshlet.triangle_count as usize) * 3,
+            )
+        };
+        meshopt::Meshlet {
+            vertices: &self.vertices[meshlet.vertex_offset as usize
+                ..meshlet.vertex_offset as usize + meshlet.vertex_count as usize],
+            triangles,
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, idx: usize) -> meshopt::Meshlet<'_> {
+        self.meshlet_from_ffi(&self.meshlets[idx])
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = meshopt::Meshlet<'_>> {
+        self.meshlets
+            .iter()
+            .map(|meshlet| self.meshlet_from_ffi(meshlet))
+    }
+}
+
+impl From<Meshlets> for XMetal2Meshlets {
+    fn from(mut value: Meshlets) -> Self {
+        let mut triangles: Vec<[u8; 3]> = Vec::new();
+        for m in &mut value.meshlets {
+            let new_triangle_offset = triangles.len();
+            for t in 0..(m.triangle_count as usize) {
+                triangles.push([
+                    value.triangles[(m.triangle_offset as usize) + (t * 3) + 0],
+                    value.triangles[(m.triangle_offset as usize) + (t * 3) + 1],
+                    value.triangles[(m.triangle_offset as usize) + (t * 3) + 2],
+                ]);
+            }
+            m.triangle_offset = new_triangle_offset as _;
+        }
+        Self {
+            meshlets: value.meshlets,
+            vertices: value.vertices,
+            triangles,
+        }
+    }
+}
+
 struct LODMeshlets {
-    pub meshlets: Meshlets,
+    pub meshlets: XMetal2Meshlets,
     meshlet_to_group_ids: Vec<MeshletGroups>,
     groups: Vec<Group>,
     dbg_meshlet_to_lod_level: Vec<u8>,
 }
 
 impl LODMeshlets {
-    fn new(lod_0_meshlets: Meshlets) -> Self {
+    fn new(lod_0_meshlets: XMetal2Meshlets) -> Self {
         Self {
             groups: vec![],
             meshlet_to_group_ids: lod_0_meshlets
@@ -284,7 +356,12 @@ impl LODMeshlets {
         }
     }
 
-    fn add_group(&mut self, group: Group, group_meshlets: &Meshlets, dbg_lod_level: u8) -> u16 {
+    fn add_group(
+        &mut self,
+        group: Group,
+        group_meshlets: XMetal2Meshlets,
+        dbg_lod_level: u8,
+    ) -> u16 {
         let vertex_offset = self.meshlets.vertices.len() as u32;
         let triangle_offset = self.meshlets.triangles.len() as u32;
 
@@ -368,7 +445,6 @@ impl LODMeshlets {
 
 pub const MESHLET_TRIANGLE_COUNT_NUM_BITS: ::std::os::raw::c_uint = 8;
 pub const MESHLET_INDICES_NUM_BITS: ::std::os::raw::c_uint = 24;
-pub const MESHLET_INDEX_ALIGNMENT_POW_2: ::std::os::raw::c_uint = 2;
 pub const MESHLET_VERTEX_COUNT_NUM_BITS: ::std::os::raw::c_uint = 8;
 pub const MESHLET_VERTEX_START_NUM_BITS: ::std::os::raw::c_uint = 24;
 
@@ -499,8 +575,13 @@ fn validate_input_mesh(mesh: &Mesh) -> Result<Cow<'_, [u32]>, MeshToMeshletMeshC
     }
 }
 
-fn compute_meshlets(indices: &[u32], vertices: &VertexDataAdapter) -> Meshlets {
-    let mut meshlets = build_meshlets(indices, vertices, 64, 96, 0.0);
+fn compute_meshlets(indices: &[u32], vertices: &VertexDataAdapter) -> XMetal2Meshlets {
+    // let mut meshlets = build_meshlets(indices, vertices, 64, 96, 0.0);
+    // let mut meshlets = build_meshlets(indices, vertices, 64, 128, 0.0);
+    // let mut meshlets = build_meshlets(indices, vertices, 64, 192, 0.0);
+    // let mut meshlets = build_meshlets(indices, vertices, 128, 192, 0.0);
+    // let mut meshlets = build_meshlets(indices, vertices, 32, 32, 0.0);
+    let mut meshlets = build_meshlets(indices, vertices, 160, 192, 0.0);
     let last_meshlet = &meshlets.meshlets[meshlets.meshlets.len() - 1];
     meshlets
         .vertices
@@ -522,7 +603,7 @@ fn compute_meshlets(indices: &[u32], vertices: &VertexDataAdapter) -> Meshlets {
         }
     }
 
-    meshlets
+    meshlets.into()
 }
 
 fn collect_triangle_edges_per_meshlet(
