@@ -37,27 +37,26 @@ pub fn export_meshlets_to_xmetal(
     let vertex_stride = mesh.get_vertex_size() as usize;
     let vertices =
         VertexDataAdapter::new(&vertex_buffer, vertex_stride, POSITION_BYTE_OFFSET).unwrap();
-    let mut lod_meshlets = LODMeshlets::new(compute_meshlets(&indices, &vertices));
+    let mut lod_levels: Vec<LODLevel> = vec![LODLevel::new(compute_meshlets(&indices, &vertices))];
 
-    // Convert meshopt_Meshlet data to a custom format
+    loop {
+        let (lod_level, child_level) = lod_levels.iter_mut().enumerate().rev().next().unwrap();
+        let parent_groups = create_groups(&child_level.meshlets);
+        let mut parent_level = LODLevel::empty();
 
-    // Build further LODs
-    let mut lod_level: u8 = 0;
-    let mut meshlets_to_simplify = 0..lod_meshlets.meshlets.len();
-    while meshlets_to_simplify.len() > 1 {
-        let groups = create_groups(meshlets_to_simplify.clone(), &lod_meshlets);
-        let next_meshlets_to_simplify_start = lod_meshlets.meshlets.len();
-
-        for group in groups.values().filter(|group| group.len() > 1) {
+        for parent_group in parent_groups.values().filter(|group| group.len() > 1) {
             // Simplify the group to ~50% triangle count
-            let Some((group_vertex_indices, group_error)) =
-                simplify_meshlet_groups(group, &lod_meshlets, &vertices, lod_level)
-            else {
+            let Some((parent_group_vertex_indices, parent_group_error)) = simplify_meshlet_groups(
+                parent_group,
+                &child_level.meshlets,
+                &vertices,
+                lod_level as _,
+            ) else {
                 continue;
             };
 
             // Build a new LOD bounding sphere for the simplified group as a whole
-            let lod_id = lod_meshlets.add_group(
+            let parent_group_id = parent_level.add_group(
                 Group {
                     // TODO(0): Replace `compute_cluster_bounds`/`meshopt_computeClusterBounds` with a
                     //          MUCH simpler and FASTER center calculation
@@ -65,31 +64,37 @@ pub fn export_meshlets_to_xmetal(
                     // - Radius is IGNORED!
                     // - Additionally, it CANNOT be inlined as it's an FFI call!
                     // - Write a small, inlineable function to do the "center of vertices" calculation
-                    center: compute_cluster_bounds(&group_vertex_indices, &vertices)
+                    center: compute_cluster_bounds(&parent_group_vertex_indices, &vertices)
                         .center
                         .into(),
                     // Add the maximum child error to the parent error to make parent error cumulative from LOD 0
                     // (we're currently building the parent from its children)
                     // TODO(0): Remove `group_error +`, see bevy change: https://github.com/bevyengine/bevy/pull/15023
-                    error: group_error
-                        + group.iter().fold(group_error, |acc, &meshlet_id| {
-                            acc.max(lod_meshlets.meshlet_group_error(meshlet_id))
-                        }),
+                    error: parent_group_error
+                        + parent_group
+                            .iter()
+                            .fold(parent_group_error, |acc, &meshlet_id| {
+                                acc.max(child_level.meshlet_group_error(meshlet_id))
+                            }),
                 },
                 // Build new meshlets using the simplified group
-                compute_meshlets(&group_vertex_indices, &vertices),
-                lod_level,
+                compute_meshlets(&parent_group_vertex_indices, &vertices),
             );
 
             // For each meshlet in the group set their parent LOD bounding sphere to that of the simplified group
-            lod_meshlets.assign_parent_group(lod_id, &group);
+            child_level.assign_parent_group(parent_group_id, &parent_group);
         }
 
-        meshlets_to_simplify = next_meshlets_to_simplify_start..lod_meshlets.meshlets.len();
-        lod_level += 1;
+        if parent_level.is_empty() {
+            break;
+        }
+        lod_levels.push(parent_level);
     }
 
-    dbg!(lod_meshlets.meshlets.len());
+    let lod_meshlets = LODMeshlets::new(lod_levels);
+    println!("max lod level= {}", lod_meshlets.max_lod_level());
+    println!("num meshlets= {}", lod_meshlets.meshlets.len());
+    println!("num lod groups= {}", lod_meshlets.groups.len());
 
     fn write_file<T: Copy + Clone>(path: impl AsRef<Path>, t: &Arc<[T]>) {
         println!("- writing: {:?}", path.as_ref());
@@ -139,13 +144,8 @@ pub fn export_meshlets_to_xmetal(
     );
     write_file(
         filepath!("m_groups.bin"),
-        &lod_meshlets.meshlet_to_group_ids.into(),
+        &lod_meshlets.meshlet_to_lod_groups.into(),
     );
-    for group in &mut lod_meshlets.groups {
-        // Optimization Precalculate: Runtime LOD selection only uses the error squared.
-        group.error = group.error * group.error;
-    }
-    println!("num lod groups= {}", lod_meshlets.groups.len());
     write_file(filepath!("lod_groups.bin"), &lod_meshlets.groups.into());
     write_file(
         filepath!("m_index.bin"),
@@ -155,11 +155,6 @@ pub fn export_meshlets_to_xmetal(
         filepath!("m_vertex.bin"),
         &lod_meshlets.meshlets.vertices.into(),
     );
-    let max_lod_level = lod_level - 1;
-    println!("max lod level= {}", max_lod_level);
-    lod_meshlets
-        .dbg_meshlet_to_lod_level
-        .insert(0, max_lod_level);
     write_file(
         filepath!("dbg_m_lods.bin"),
         &lod_meshlets.dbg_meshlet_to_lod_level.into(),
@@ -268,6 +263,14 @@ struct XMetal2Meshlets {
 }
 
 impl XMetal2Meshlets {
+    fn empty() -> Self {
+        Self {
+            meshlets: vec![],
+            vertices: vec![],
+            triangles: vec![],
+        }
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.meshlets.len()
@@ -326,18 +329,17 @@ impl From<Meshlets> for XMetal2Meshlets {
     }
 }
 
-struct LODMeshlets {
+struct LODLevel {
     pub meshlets: XMetal2Meshlets,
-    meshlet_to_group_ids: Vec<MeshletGroups>,
+    meshlet_to_lod_groups: Vec<MeshletGroups>,
     groups: Vec<Group>,
-    dbg_meshlet_to_lod_level: Vec<u8>,
 }
 
-impl LODMeshlets {
-    fn new(lod_0_meshlets: XMetal2Meshlets) -> Self {
+impl LODLevel {
+    fn new(meshlets: XMetal2Meshlets) -> Self {
         Self {
             groups: vec![],
-            meshlet_to_group_ids: lod_0_meshlets
+            meshlet_to_lod_groups: meshlets
                 .meshlets
                 .iter()
                 .map(|_| MeshletGroups {
@@ -345,23 +347,29 @@ impl LODMeshlets {
                     group_id: MeshletGroups::NO_GROUP_ID,
                 })
                 .collect(),
-            dbg_meshlet_to_lod_level: vec![0; lod_0_meshlets.len()],
-            meshlets: lod_0_meshlets,
+            meshlets,
         }
+    }
+
+    fn empty() -> Self {
+        Self {
+            groups: vec![],
+            meshlet_to_lod_groups: vec![],
+            meshlets: XMetal2Meshlets::empty(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.groups.len() == 0
     }
 
     fn assign_parent_group(&mut self, parent_group_id: u16, meshlet_ids: &[usize]) {
         for &m in meshlet_ids {
-            self.meshlet_to_group_ids[m].parent_group_id = parent_group_id;
+            self.meshlet_to_lod_groups[m].parent_group_id = parent_group_id;
         }
     }
 
-    fn add_group(
-        &mut self,
-        group: Group,
-        group_meshlets: XMetal2Meshlets,
-        dbg_lod_level: u8,
-    ) -> u16 {
+    fn add_group(&mut self, group: Group, group_meshlets: XMetal2Meshlets) -> u16 {
         let vertex_offset = self.meshlets.vertices.len() as u32;
         let triangle_offset = self.meshlets.triangles.len() as u32;
 
@@ -386,25 +394,97 @@ impl LODMeshlets {
         let group_id = group_id as u16;
         self.groups.push(group);
 
-        self.meshlet_to_group_ids.extend_from_slice(&vec![
+        self.meshlet_to_lod_groups.extend_from_slice(&vec![
             MeshletGroups {
                 parent_group_id: MeshletGroups::NO_GROUP_ID,
                 group_id,
             };
             group_meshlets.meshlets.len()
         ]);
-        self.dbg_meshlet_to_lod_level
-            .extend_from_slice(&vec![dbg_lod_level; group_meshlets.meshlets.len()]);
         group_id
     }
 
     fn meshlet_group_error(&self, meshlet_id: usize) -> f32 {
-        let self_lod = self.meshlet_to_group_ids[meshlet_id].group_id;
+        let self_lod = self.meshlet_to_lod_groups[meshlet_id].group_id;
         if self_lod == MeshletGroups::NO_GROUP_ID {
             0.
         } else {
             self.groups[self_lod as usize].error
         }
+    }
+}
+
+struct LODMeshlets {
+    pub meshlets: XMetal2Meshlets,
+    meshlet_to_lod_groups: Vec<MeshletGroups>,
+    groups: Vec<Group>,
+    dbg_meshlet_to_lod_level: Vec<u8>,
+}
+
+impl LODMeshlets {
+    fn new(lod_levels: Vec<LODLevel>) -> Self {
+        let mut meshlets = XMetal2Meshlets::empty();
+        let mut meshlet_to_lod_groups: Vec<MeshletGroups> = vec![];
+        let mut groups: Vec<Group> = vec![];
+        let mut dbg_meshlet_to_lod_level: Vec<u8> = vec![(lod_levels.len() - 1) as u8];
+
+        let mut last_level_meshlet_to_lod_groups_offset = 0;
+        let mut lod_level = lod_levels.len() - 1;
+        for level in lod_levels.into_iter().rev() {
+            let triangle_offset: u32 = meshlets.triangles.len() as _;
+            let vertices_offset: u32 = meshlets.vertices.len() as _;
+
+            meshlets
+                .triangles
+                .extend_from_slice(&level.meshlets.triangles);
+            meshlets
+                .vertices
+                .extend_from_slice(&level.meshlets.vertices);
+            let num_meshlets = level.meshlets.meshlets.len();
+            meshlets
+                .meshlets
+                .extend(
+                    level
+                        .meshlets
+                        .meshlets
+                        .into_iter()
+                        .map(|m| meshopt_Meshlet {
+                            triangle_offset: triangle_offset + m.triangle_offset,
+                            vertex_offset: vertices_offset + m.vertex_offset,
+                            vertex_count: m.vertex_count,
+                            triangle_count: m.triangle_count,
+                        }),
+                );
+
+            let meshlet_to_lod_groups_offset: u16 = meshlet_to_lod_groups.len() as _;
+            meshlet_to_lod_groups.extend(level.meshlet_to_lod_groups.iter().map(|g| {
+                MeshletGroups {
+                    group_id: meshlet_to_lod_groups_offset + g.group_id,
+                    parent_group_id: last_level_meshlet_to_lod_groups_offset + g.parent_group_id,
+                }
+            }));
+            last_level_meshlet_to_lod_groups_offset = meshlet_to_lod_groups_offset;
+
+            groups.extend(level.groups.iter().map(|g| Group {
+                center: g.center,
+                // IMPORTANT: Optimization Precalculate - Runtime LOD selection only uses the error squared.
+                // - See lod_group.h projected_sphere_area
+                error: g.error * g.error,
+            }));
+            dbg_meshlet_to_lod_level.extend(core::iter::repeat_n(lod_level as u8, num_meshlets));
+            lod_level -= 1;
+        }
+
+        Self {
+            meshlets,
+            meshlet_to_lod_groups,
+            groups,
+            dbg_meshlet_to_lod_level,
+        }
+    }
+
+    fn max_lod_level(&self) -> u8 {
+        self.dbg_meshlet_to_lod_level[0]
     }
 
     fn generate_meshlet_bounds(&self, vertices: &VertexDataAdapter) -> Arc<[MeshletBounds]> {
@@ -533,24 +613,18 @@ impl From<meshopt_Bounds> for MeshletBounds {
     }
 }
 
-fn create_groups(
-    meshlets_to_simplify: Range<usize>,
-    meshlets: &LODMeshlets,
-) -> bevy_utils::hashbrown::HashMap<i32, Vec<usize>> {
+fn create_groups(meshlets: &XMetal2Meshlets) -> bevy_utils::hashbrown::HashMap<i32, Vec<usize>> {
+    let meshlet_ids = 0..meshlets.len();
     // For each meshlet build a set of triangle edges
-    let triangle_edges_per_meshlet =
-        collect_triangle_edges_per_meshlet(meshlets_to_simplify.clone(), meshlets);
+    let triangle_edges_per_meshlet = collect_triangle_edges_per_meshlet(meshlets);
 
     // For each meshlet build a list of connected meshlets (meshlets that share a triangle edge)
     let connected_meshlets_per_meshlet =
-        find_connected_meshlets(meshlets_to_simplify.clone(), &triangle_edges_per_meshlet);
+        find_connected_meshlets(meshlet_ids.clone(), &triangle_edges_per_meshlet);
 
     // Group meshlets into roughly groups of 4, grouping meshlets with a high number of shared edges
     // http://glaros.dtc.umn.edu/gkhome/fetch/sw/metis/manual.pdf
-    let groups = group_meshlets(
-        meshlets_to_simplify.clone(),
-        &connected_meshlets_per_meshlet,
-    );
+    let groups = group_meshlets(meshlet_ids.clone(), &connected_meshlets_per_meshlet);
     groups
 }
 
@@ -607,12 +681,10 @@ fn compute_meshlets(indices: &[u32], vertices: &VertexDataAdapter) -> XMetal2Mes
 }
 
 fn collect_triangle_edges_per_meshlet(
-    simplification_queue: Range<usize>,
-    meshlets: &LODMeshlets,
+    meshlets: &XMetal2Meshlets,
 ) -> HashMap<usize, HashSet<(u32, u32)>> {
     let mut triangle_edges_per_meshlet = HashMap::new();
-    for meshlet_id in simplification_queue {
-        let meshlet = meshlets.meshlets.get(meshlet_id);
+    for (meshlet_id, meshlet) in meshlets.iter().enumerate() {
         let meshlet_triangle_edges = triangle_edges_per_meshlet
             .entry(meshlet_id)
             .or_insert(HashSet::new());
@@ -693,14 +765,14 @@ fn group_meshlets(
 
 fn simplify_meshlet_groups(
     group_meshlets: &[usize],
-    meshlets: &LODMeshlets,
+    meshlets: &XMetal2Meshlets,
     vertices: &VertexDataAdapter<'_>,
     lod_level: u8,
 ) -> Option<(Vec<u32>, f32)> {
     // Build a new index buffer into the mesh vertex data by combining all meshlet data in the group
     let mut group_indices = Vec::new();
     for meshlet_id in group_meshlets {
-        let meshlet = meshlets.meshlets.get(*meshlet_id);
+        let meshlet = meshlets.get(*meshlet_id);
         for meshlet_index in meshlet.triangles {
             group_indices.push(meshlet.vertices[*meshlet_index as usize]);
         }
