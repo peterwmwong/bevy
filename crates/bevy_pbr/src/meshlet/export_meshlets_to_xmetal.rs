@@ -12,7 +12,122 @@ use meshopt::{
     simplify, simplify_scale, Meshlets, SimplifyOptions, VertexDataAdapter,
 };
 use metis::Graph;
-use std::{borrow::Cow, ops::Range, path::Path, sync::Arc};
+use std::{
+    borrow::Cow,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+const POSITION_BYTE_OFFSET: usize = 0;
+
+fn write_model(
+    filepath: PathBuf,
+    vertices: &VertexDataAdapter<'_>,
+    denorm_scale: [f32; 3],
+    lod_meshlets: LODMeshlets,
+) {
+    println!("max lod level= {}", lod_meshlets.max_lod_level());
+    println!("num meshlets= {}", lod_meshlets.meshlets.len());
+    println!("num lod groups= {}", lod_meshlets.groups.len());
+
+    fn write_file<T: Copy + Clone>(path: impl AsRef<Path>, t: &Arc<[T]>) {
+        println!("- writing: {:?}", path.as_ref());
+        #[allow(unsafe_code)]
+        let a = unsafe {
+            core::slice::from_raw_parts(t.as_ptr() as *const _, core::mem::size_of::<T>() * t.len())
+        };
+        std::fs::write(path, a).unwrap();
+    }
+    let _ = std::fs::create_dir(&filepath);
+    write_file(
+        filepath.join("meshes.bin"),
+        &[MeshMaterials {
+            base_material_id: 0,
+            roughness_material_id: 0,
+            metalness_material_id: 0,
+            normal_material_id: 0,
+        }]
+        .into(),
+    );
+    write_file(
+        filepath.join("m_mesh.bin"),
+        &core::iter::repeat(0)
+            .take(lod_meshlets.meshlets.len())
+            .collect::<Vec<u8>>()
+            .into(),
+    );
+    write_file(
+        filepath.join("geometry.info"),
+        &[lod_meshlets.model_metadata(&vertices)].into(),
+    );
+    write_file(
+        filepath.join("meshlets.bin"),
+        &lod_meshlets.generate_xmetal_meshlets(),
+    );
+    write_file(
+        filepath.join("bounds.bin"),
+        &lod_meshlets.generate_meshlet_bounds(&vertices),
+    );
+    write_file(
+        filepath.join("m_groups.bin"),
+        &lod_meshlets.meshlet_to_lod_groups.into(),
+    );
+    write_file(filepath.join("lod_groups.bin"), &lod_meshlets.groups.into());
+    write_file(
+        filepath.join("m_index.bin"),
+        &lod_meshlets.meshlets.triangles.into(),
+    );
+    write_file(
+        filepath.join("m_vertex.bin"),
+        &lod_meshlets.meshlets.vertices.into(),
+    );
+    write_file(
+        filepath.join("dbg_m_lods.bin"),
+        &lod_meshlets.dbg_meshlet_to_lod_level.into(),
+    );
+
+    // TODO(0): Add generating meshes_sbr.bin see `tmp_generate_meshes_sphere_bounds_radius()` on
+    // `select_meshlets-remove-threadgroup-mem` branch
+
+    {
+        let mut max_sphere_bounds_radius = f32::MIN;
+        let vertex_count = vertices.vertex_count;
+        #[allow(unsafe_code)]
+        let vertex_positions: Vec<EncodedVertexPosition> = unsafe {
+            let start = vertices.pos_ptr() as *const u8;
+            (0..vertex_count)
+                .map(|i| {
+                    let p: [f32; 3] =
+                        *(start.byte_add(i * vertices.vertex_stride) as *const [f32; 3]);
+                    max_sphere_bounds_radius = max_sphere_bounds_radius
+                        .max((p[0].powi(2) + p[1].powi(2) + p[2].powi(2)).sqrt());
+                    let p_norm: [f32; 3] = core::array::from_fn(|i| p[i] / denorm_scale[i]);
+                    let p_quant = EncodedVertexPosition::from_f32(&p_norm);
+                    p_quant
+                })
+                .collect()
+        };
+        write_file(filepath.join("vertex_p.bin"), &vertex_positions.into());
+
+        #[repr(C)]
+        #[derive(Copy, Clone, PartialEq, Default)]
+        pub struct EncodedVertex {
+            pub positionxy: ::std::os::raw::c_uint,
+            pub positionz_n1: ::std::os::raw::c_uint,
+            pub n0_tangent_mikkt: ::std::os::raw::c_uint,
+            pub tx_coord: ::std::os::raw::c_uint,
+        }
+        let vertices: Arc<[EncodedVertex]> = (vec![EncodedVertex::default(); vertex_count]).into();
+        write_file(filepath.join("vertex.bin"), &vertices);
+
+        write_file(
+            filepath.join("meshes_sbr.bin"),
+            &[max_sphere_bounds_radius].into(),
+        );
+    };
+    write_file(filepath.join("meshes_ds.bin"), &[denorm_scale].into());
+}
 
 /// Process a [`Mesh`] to generate a [`MeshletMesh`].
 ///
@@ -28,7 +143,6 @@ pub fn export_meshlets_to_xmetal(
     mesh: &Mesh,
     denorm_scale: [f32; 3],
 ) -> Result<(), MeshToMeshletMeshConversionError> {
-    const POSITION_BYTE_OFFSET: usize = 0;
     // Validate mesh format
     let indices = validate_input_mesh(mesh)?;
 
@@ -91,114 +205,18 @@ pub fn export_meshlets_to_xmetal(
         lod_levels.push(parent_level);
     }
 
-    let lod_meshlets = LODMeshlets::new(lod_levels);
-    println!("max lod level= {}", lod_meshlets.max_lod_level());
-    println!("num meshlets= {}", lod_meshlets.meshlets.len());
-    println!("num lod groups= {}", lod_meshlets.groups.len());
-
-    fn write_file<T: Copy + Clone>(path: impl AsRef<Path>, t: &Arc<[T]>) {
-        println!("- writing: {:?}", path.as_ref());
-        #[allow(unsafe_code)]
-        let a = unsafe {
-            core::slice::from_raw_parts(t.as_ptr() as *const _, core::mem::size_of::<T>() * t.len())
-        };
-        std::fs::write(path, a).unwrap();
-    }
-    macro_rules! filepath {
-        ($p:literal) => {
-            concat!(
-                "/Users/pwong/projects/x-metal2/assets/generated/models/bevy-bunny/",
-                $p
-            )
-        };
-    }
-    let _ = std::fs::create_dir(filepath!(""));
-    write_file(
-        filepath!("meshes.bin"),
-        &[MeshMaterials {
-            base_material_id: 0,
-            roughness_material_id: 0,
-            metalness_material_id: 0,
-            normal_material_id: 0,
-        }]
-        .into(),
+    write_model(
+        "/Users/pwong/projects/x-metal2/assets/generated/models/bevy-bunny-ASCENDING/".into(),
+        &vertices,
+        denorm_scale,
+        LODMeshlets::ascending(lod_levels.iter()),
     );
-    write_file(
-        filepath!("m_mesh.bin"),
-        &core::iter::repeat(0)
-            .take(lod_meshlets.meshlets.len())
-            .collect::<Vec<u8>>()
-            .into(),
+    write_model(
+        "/Users/pwong/projects/x-metal2/assets/generated/models/bevy-bunny-DESCENDING/".into(),
+        &vertices,
+        denorm_scale,
+        LODMeshlets::descending(lod_levels.iter()),
     );
-    write_file(
-        filepath!("geometry.info"),
-        &[lod_meshlets.model_metadata(&vertices)].into(),
-    );
-    write_file(
-        filepath!("meshlets.bin"),
-        &lod_meshlets.generate_xmetal_meshlets(),
-    );
-    write_file(
-        filepath!("bounds.bin"),
-        &lod_meshlets.generate_meshlet_bounds(&vertices),
-    );
-    write_file(
-        filepath!("m_groups.bin"),
-        &lod_meshlets.meshlet_to_lod_groups.into(),
-    );
-    write_file(filepath!("lod_groups.bin"), &lod_meshlets.groups.into());
-    write_file(
-        filepath!("m_index.bin"),
-        &lod_meshlets.meshlets.triangles.into(),
-    );
-    write_file(
-        filepath!("m_vertex.bin"),
-        &lod_meshlets.meshlets.vertices.into(),
-    );
-    write_file(
-        filepath!("dbg_m_lods.bin"),
-        &lod_meshlets.dbg_meshlet_to_lod_level.into(),
-    );
-
-    // TODO(0): Add generating meshes_sbr.bin see `tmp_generate_meshes_sphere_bounds_radius()` on
-    // `select_meshlets-remove-threadgroup-mem` branch
-
-    {
-        let mut max_sphere_bounds_radius = f32::MIN;
-        let vertex_count = vertex_buffer.len() / vertex_stride;
-        #[allow(unsafe_code)]
-        let vertex_positions: Vec<EncodedVertexPosition> = unsafe {
-            let start = vertex_buffer.as_ptr().byte_add(POSITION_BYTE_OFFSET);
-            (0..vertex_count)
-                .map(|i| {
-                    let p: [f32; 3] = *(start.byte_add(i * vertex_stride) as *const [f32; 3]);
-                    max_sphere_bounds_radius = max_sphere_bounds_radius
-                        .max((p[0].powi(2) + p[1].powi(2) + p[2].powi(2)).sqrt());
-                    let p_norm: [f32; 3] = core::array::from_fn(|i| p[i] / denorm_scale[i]);
-                    let p_quant = EncodedVertexPosition::from_f32(&p_norm);
-                    p_quant
-                })
-                .collect()
-        };
-        write_file(filepath!("vertex_p.bin"), &vertex_positions.into());
-
-        #[repr(C)]
-        #[derive(Copy, Clone, PartialEq, Default)]
-        pub struct EncodedVertex {
-            pub positionxy: ::std::os::raw::c_uint,
-            pub positionz_n1: ::std::os::raw::c_uint,
-            pub n0_tangent_mikkt: ::std::os::raw::c_uint,
-            pub tx_coord: ::std::os::raw::c_uint,
-        }
-        let vertices: Arc<[EncodedVertex]> = (vec![EncodedVertex::default(); vertex_count]).into();
-        write_file(filepath!("vertex.bin"), &vertices);
-
-        write_file(
-            filepath!("meshes_sbr.bin"),
-            &[max_sphere_bounds_radius].into(),
-        );
-    };
-    write_file(filepath!("meshes_ds.bin"), &[denorm_scale].into());
     Ok(())
 }
 
@@ -421,16 +439,40 @@ struct LODMeshlets {
     dbg_meshlet_to_lod_level: Vec<u8>,
 }
 
+struct LodLevelIterator<'a, T: ExactSizeIterator<Item = (usize, &'a LODLevel)>> {
+    lod_levels: T,
+    is_descending_levels_of_detail: bool,
+}
+
 impl LODMeshlets {
-    fn new(lod_levels: Vec<LODLevel>) -> Self {
+    fn descending<'a>(descending_lod_levels: impl ExactSizeIterator<Item = &'a LODLevel>) -> Self {
+        Self::new(LodLevelIterator {
+            lod_levels: descending_lod_levels.enumerate(),
+            is_descending_levels_of_detail: true,
+        })
+    }
+    fn ascending<'a>(
+        descending_lod_levels: impl ExactSizeIterator<Item = &'a LODLevel> + DoubleEndedIterator,
+    ) -> Self {
+        Self::new(LodLevelIterator {
+            lod_levels: descending_lod_levels.enumerate().rev(),
+            is_descending_levels_of_detail: false,
+        })
+    }
+
+    fn new<'a>(
+        LodLevelIterator {
+            lod_levels,
+            is_descending_levels_of_detail,
+        }: LodLevelIterator<'a, impl ExactSizeIterator<Item = (usize, &'a LODLevel)>>,
+    ) -> Self {
         let mut meshlets = XMetal2Meshlets::empty();
         let mut meshlet_to_lod_groups: Vec<MeshletGroups> = vec![];
         let mut groups: Vec<Group> = vec![];
         let mut dbg_meshlet_to_lod_level: Vec<u8> = vec![(lod_levels.len() - 1) as u8];
 
-        let mut last_level_meshlet_to_lod_groups_offset = 0;
-        let mut lod_level = lod_levels.len() - 1;
-        for level in lod_levels.into_iter().rev() {
+        let mut prev_level_groups_offset = 0;
+        for (lod_level, level) in lod_levels {
             let triangle_offset: u32 = meshlets.triangles.len() as _;
             let vertices_offset: u32 = meshlets.vertices.len() as _;
 
@@ -443,36 +485,36 @@ impl LODMeshlets {
             let num_meshlets = level.meshlets.meshlets.len();
             meshlets
                 .meshlets
-                .extend(
-                    level
-                        .meshlets
-                        .meshlets
-                        .into_iter()
-                        .map(|m| meshopt_Meshlet {
-                            triangle_offset: triangle_offset + m.triangle_offset,
-                            vertex_offset: vertices_offset + m.vertex_offset,
-                            vertex_count: m.vertex_count,
-                            triangle_count: m.triangle_count,
-                        }),
-                );
+                .extend(level.meshlets.meshlets.iter().map(|m| meshopt_Meshlet {
+                    triangle_offset: triangle_offset + m.triangle_offset,
+                    vertex_offset: vertices_offset + m.vertex_offset,
+                    vertex_count: m.vertex_count,
+                    triangle_count: m.triangle_count,
+                }));
 
-            let meshlet_to_lod_groups_offset: u16 = meshlet_to_lod_groups.len() as _;
-            meshlet_to_lod_groups.extend(level.meshlet_to_lod_groups.iter().map(|g| {
-                MeshletGroups {
-                    group_id: meshlet_to_lod_groups_offset + g.group_id,
-                    parent_group_id: last_level_meshlet_to_lod_groups_offset + g.parent_group_id,
-                }
-            }));
-            last_level_meshlet_to_lod_groups_offset = meshlet_to_lod_groups_offset;
-
+            let cur_level_offset: u16 = groups.len() as _;
+            let next_level_offset: u16 = cur_level_offset + (level.groups.len() as u16);
             groups.extend(level.groups.iter().map(|g| Group {
                 center: g.center,
                 // IMPORTANT: Optimization Precalculate - Runtime LOD selection only uses the error squared.
                 // - See lod_group.h projected_sphere_area
                 error: g.error * g.error,
             }));
+
+            meshlet_to_lod_groups.extend(level.meshlet_to_lod_groups.iter().map(|g| {
+                MeshletGroups {
+                    group_id: cur_level_offset + g.group_id,
+                    parent_group_id: if is_descending_levels_of_detail {
+                        next_level_offset + g.parent_group_id
+                    } else {
+                        prev_level_groups_offset + g.parent_group_id
+                    },
+                }
+            }));
+
+            prev_level_groups_offset = cur_level_offset;
+
             dbg_meshlet_to_lod_level.extend(core::iter::repeat_n(lod_level as u8, num_meshlets));
-            lod_level -= 1;
         }
 
         Self {
