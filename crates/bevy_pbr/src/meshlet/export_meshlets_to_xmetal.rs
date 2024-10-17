@@ -1,4 +1,3 @@
-use super::{EncodedVertexPosition, ModelMetadata};
 use bevy_math::Vec3;
 use bevy_render::{
     mesh::{Indices, Mesh},
@@ -85,6 +84,14 @@ fn write_model(
     write_file(
         filepath.join("dbg_m_lods.bin"),
         &lod_meshlets.dbg_meshlet_to_lod_level.into(),
+    );
+    write_file(
+        filepath.join("lod_m_end.bin"),
+        &lod_meshlets.lod_level_to_meshlet_end.into(),
+    );
+    write_file(
+        filepath.join("g_lods.bin"),
+        &lod_meshlets.group_to_lod_level.into(),
     );
 
     // TODO(0): Add generating meshes_sbr.bin see `tmp_generate_meshes_sphere_bounds_radius()` on
@@ -205,19 +212,52 @@ pub fn export_meshlets_to_xmetal(
         lod_levels.push(parent_level);
     }
 
+    let model_name = "bevy-bunny-ASCENDING-tmp";
+    println!("export_meshlets_to_metal: Writing ");
     write_model(
-        "/Users/pwong/projects/x-metal2/assets/generated/models/bevy-bunny-ASCENDING/".into(),
+        format!("/Users/pwong/projects/x-metal2/assets/generated/models/{model_name}/").into(),
         &vertices,
         denorm_scale,
         LODMeshlets::ascending(lod_levels.iter()),
     );
-    write_model(
-        "/Users/pwong/projects/x-metal2/assets/generated/models/bevy-bunny-DESCENDING/".into(),
-        &vertices,
-        denorm_scale,
-        LODMeshlets::descending(lod_levels.iter()),
-    );
+    // write_model(
+    //     "/Users/pwong/projects/x-metal2/assets/generated/models/bevy-bunny-DESCENDING/".into(),
+    //     &vertices,
+    //     denorm_scale,
+    //     LODMeshlets::descending(lod_levels.iter()),
+    // );
     Ok(())
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EncodedVertexPosition([i16; 3]);
+impl EncodedVertexPosition {
+    pub const ZERO: Self = Self([0; 3]);
+
+    #[inline]
+    pub fn from_f32(&p: &[f32; 3]) -> Self {
+        assert!(
+            p.iter().find(|&&c| c < -1. || c > 1.).is_none(),
+            "BAD POSITION: {p:?}"
+        );
+        Self(p.map(|c| (c * (i16::MAX as f32)) as i16))
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub struct ModelMetadata {
+    pub(crate) meshes_len: u32,
+    pub(crate) lod_groups_len: u32,
+    pub(crate) lod_levels_len: u32,
+    pub(crate) meshlets_len: u32,
+    // TODO(0): Replace indices_len with triangle_count to save 1.5 bits (or increase
+    //          amount by 3x).
+    pub(crate) meshlet_indices_len: u32,
+    pub(crate) meshlet_vertices_len: u32,
+    pub(crate) vertices_len: u32,
 }
 
 // TODO(0): Optimize with normaliztion/quantization
@@ -434,6 +474,8 @@ impl LODLevel {
 
 struct LODMeshlets {
     pub meshlets: XMetal2Meshlets,
+    group_to_lod_level: Vec<u8>,
+    lod_level_to_meshlet_end: Vec<u16>,
     meshlet_to_lod_groups: Vec<MeshletGroups>,
     groups: Vec<Group>,
     dbg_meshlet_to_lod_level: Vec<u8>,
@@ -469,10 +511,13 @@ impl LODMeshlets {
         let mut meshlets = XMetal2Meshlets::empty();
         let mut meshlet_to_lod_groups: Vec<MeshletGroups> = vec![];
         let mut groups: Vec<Group> = vec![];
+        let mut group_to_lod_level: Vec<u8> = vec![];
+        let mut lod_level_to_meshlet_end: Vec<u16> = vec![];
         let mut dbg_meshlet_to_lod_level: Vec<u8> = vec![(lod_levels.len() - 1) as u8];
 
         let mut prev_level_groups_offset = 0;
-        for (lod_level, level) in lod_levels {
+        println!("[LODMeshlets] LOD Levels");
+        for (actual_lod_level, (lod_level, level)) in lod_levels.enumerate() {
             let triangle_offset: u32 = meshlets.triangles.len() as _;
             let vertices_offset: u32 = meshlets.vertices.len() as _;
 
@@ -492,14 +537,23 @@ impl LODMeshlets {
                     triangle_count: m.triangle_count,
                 }));
 
+            lod_level_to_meshlet_end.push(meshlets.meshlets.len() as _);
+
             let cur_level_offset: u16 = groups.len() as _;
-            let next_level_offset: u16 = cur_level_offset + (level.groups.len() as u16);
+            let num_groups = level.groups.len();
+            let next_level_offset: u16 = cur_level_offset + (num_groups as u16);
             groups.extend(level.groups.iter().map(|g| Group {
                 center: g.center,
                 // IMPORTANT: Optimization Precalculate - Runtime LOD selection only uses the error squared.
                 // - See lod_group.h projected_sphere_area
                 error: g.error * g.error,
             }));
+            group_to_lod_level.extend(core::iter::repeat_n(actual_lod_level as u8, num_groups));
+
+            println!(
+                "    [{actual_lod_level}] lod_groups: {num_groups} meshlets: {num_meshlets} lod_level_to_meshlet_end={}",
+                *lod_level_to_meshlet_end.last().unwrap()
+            );
 
             meshlet_to_lod_groups.extend(level.meshlet_to_lod_groups.iter().map(|g| {
                 MeshletGroups {
@@ -518,10 +572,12 @@ impl LODMeshlets {
         }
 
         Self {
-            meshlets,
-            meshlet_to_lod_groups,
-            groups,
             dbg_meshlet_to_lod_level,
+            group_to_lod_level,
+            groups,
+            lod_level_to_meshlet_end,
+            meshlet_to_lod_groups,
+            meshlets,
         }
     }
 
@@ -561,6 +617,7 @@ impl LODMeshlets {
             meshlet_indices_len: self.meshlets.triangles.len() as _,
             meshlet_vertices_len: self.meshlets.vertices.len() as _,
             vertices_len: vertices.vertex_count as _,
+            lod_levels_len: self.lod_level_to_meshlet_end.len() as _,
         }
     }
 }
