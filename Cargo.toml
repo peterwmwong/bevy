@@ -135,6 +135,9 @@ default = [
   "vorbis",
   "webgl2",
   "x11",
+
+  "meshlet",
+  "meshlet_processor"
 ]
 
 # Provides an implementation for picking meshes
@@ -449,6 +452,8 @@ ghost_nodes = ["bevy_internal/ghost_nodes"]
 
 [dependencies]
 bevy_internal = { path = "crates/bevy_internal", version = "0.15.0-dev", default-features = false }
+tobj = "4.0.1"
+ahash = "0.8.8"
 
 # Wasm does not support dynamic linking.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
@@ -1219,6 +1224,12 @@ setup = [
     "https://raw.githubusercontent.com/JMS55/bevy_meshlet_asset/defbd9b32072624d40d57de7d345c66a9edf5d0b/bunny.meshlet_mesh",
   ],
 ]
+
+[[example]]
+name = "meshlet_asset_exporter"
+path = "examples/3d/meshlet_asset_exporter.rs"
+doc-scrape-examples = false
+required-features = ["meshlet"]
 
 [[example]]
 name = "mesh_ray_cast"

@@ -6,6 +6,7 @@
     html_logo_url = "https://bevyengine.org/assets/icon.png",
     html_favicon_url = "https://bevyengine.org/assets/icon.png"
 )]
+#![feature(portable_simd)]
 
 extern crate alloc;
 

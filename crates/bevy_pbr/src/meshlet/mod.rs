@@ -3,16 +3,22 @@
 
 mod asset;
 #[cfg(feature = "meshlet_processor")]
+mod export_meshlets_to_xmetal;
+#[cfg(feature = "meshlet_processor")]
 mod from_mesh;
 mod instance_manager;
 mod material_pipeline_prepare;
 mod material_shade_nodes;
 mod meshlet_mesh_manager;
+mod min_max;
 mod persistent_buffer;
 mod persistent_buffer_impls;
 mod pipelines;
 mod resource_manager;
 mod visibility_buffer_raster_node;
+
+pub use export_meshlets_to_xmetal::export_meshlets_to_xmetal;
+pub use min_max::MinMax;
 
 pub mod graph {
     use bevy_render::render_graph::RenderLabel;
