@@ -3,14 +3,11 @@
 
 // Note: This example showcases the exporting a meshlet asset.
 
-use bevy::{
-    asset::io::file::FileAssetReader,
-    pbr::experimental::meshlet::{export_meshlets_to_xmetal, MinMax},
-    prelude::*,
-    render::{
-        mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
-        render_asset::RenderAssetUsages,
-    },
+use bevy_asset::io::file::FileAssetReader;
+use bevy_pbr::experimental::meshlet::{export_meshlets_to_xmetal, MinMax};
+use bevy_render::{
+    mesh::{Indices, Mesh, PrimitiveTopology, VertexAttributeValues},
+    render_asset::RenderAssetUsages,
 };
 use std::{fs::File, io::BufReader, process::ExitCode};
 
@@ -19,7 +16,10 @@ fn main() -> ExitCode {
     let position_denorm_scale;
     {
         println!(">>> Loading Mesh...");
-        let model_path = FileAssetReader::new("assets/models/bunny.obj");
+        let model_path = FileAssetReader::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/models/bunny.obj"
+        ));
         let model_path = model_path.root_path();
         let mut reader = BufReader::new(
             File::open(model_path)
@@ -80,7 +80,6 @@ fn main() -> ExitCode {
             Mesh::ATTRIBUTE_UV_0,
             VertexAttributeValues::Float32x2(texcoords.into_iter().array_chunks::<2>().collect()),
         );
-        m.generate_tangents().unwrap();
         println!(">>> Done!");
     }
 

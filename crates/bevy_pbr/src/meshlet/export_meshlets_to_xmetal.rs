@@ -35,7 +35,7 @@ fn write_model(
         println!("- writing: {:?}", path.as_ref());
         #[allow(unsafe_code)]
         let a = unsafe {
-            core::slice::from_raw_parts(t.as_ptr() as *const _, core::mem::size_of::<T>() * t.len())
+            core::slice::from_raw_parts(t.as_ptr() as *const _, size_of::<T>() * t.len())
         };
         std::fs::write(path, a).unwrap();
     }
@@ -335,10 +335,7 @@ impl XMetal2Meshlets {
         self.meshlets.len()
     }
 
-    fn meshlet_from_ffi<'a>(
-        &'a self,
-        meshlet: &meshopt::ffi::meshopt_Meshlet,
-    ) -> meshopt::Meshlet<'a> {
+    fn meshlet_from_ffi<'a>(&'a self, meshlet: &meshopt_Meshlet) -> meshopt::Meshlet<'a> {
         #[allow(unsafe_code)]
         let triangles: &'a [u8] = unsafe {
             core::slice::from_raw_parts(
@@ -737,7 +734,6 @@ fn validate_input_mesh(mesh: &Mesh) -> Result<Cow<'_, [u32]>, MeshToMeshletMeshC
         Mesh::ATTRIBUTE_POSITION.id,
         Mesh::ATTRIBUTE_NORMAL.id,
         Mesh::ATTRIBUTE_UV_0.id,
-        Mesh::ATTRIBUTE_TANGENT.id,
     ]) {
         return Err(MeshToMeshletMeshConversionError::WrongMeshVertexAttributes);
     }

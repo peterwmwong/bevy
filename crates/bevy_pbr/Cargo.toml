@@ -49,6 +49,8 @@ bevy_window = { path = "../bevy_window", version = "0.15.0-dev" }
 
 
 # other
+ahash = "0.8.8"
+tobj = "4.0.1"
 bitflags = "2.3"
 fixedbitset = "0.5"
 derive_more = { version = "1", default-features = false, features = [
