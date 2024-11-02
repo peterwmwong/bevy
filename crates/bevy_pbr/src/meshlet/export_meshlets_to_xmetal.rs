@@ -8,9 +8,9 @@ use derive_more::derive::{Display, Error};
 use itertools::Itertools;
 use meshopt::{
     build_meshlets, compute_meshlet_bounds,
-    ffi::{meshopt_Bounds, meshopt_Meshlet, meshopt_optimizeMeshlet},
-    generate_vertex_remap_multi, simplify_scale, simplify_with_attributes_and_locks, Meshlets,
-    SimplifyOptions, VertexDataAdapter, VertexStream,
+    ffi::{meshopt_Bounds, meshopt_Meshlet},
+    generate_vertex_remap_multi, simplify_with_attributes_and_locks, Meshlets, SimplifyOptions,
+    VertexDataAdapter, VertexStream,
 };
 use metis::Graph;
 use smallvec::SmallVec;
@@ -19,6 +19,108 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+const MAX_TRIANGLES: usize = 160;
+const MAX_VERTICES: usize = 128;
+
+/*
+===
+64t
+===
+
+32v 64t
+    low_vert: 0 (0)
+    low_tri:  0.15150332 (1164)
+
+64v 64t
+    low_vert: 0.07341772 (348)
+    low_tri:  0.0778481 (369)
+
+===
+96t
+===
+
+32v 96t
+    low_vert: 0 (0)
+    low_tri:  1 (7683)
+
+64v 96t
+    low_vert: 0.050294116 (171)
+    low_tri:  0.09852941 (335)
+
+96v 96t
+    low_vert: 0.47395173 (1492)
+    low_tri:  0.076238886 (240)
+
+====
+128t
+====
+
+64v 128t
+    low_vert: 0.048401553 (162)
+    low_tri:  0.6540185 (2189)
+
+96v 128t
+    low_vert: 0.09253112 (223)
+    low_tri:  0.10165975 (245)
+
+128v 128t
+    low_vert: 0.91082805 (2145)
+    low_tri:  0.0836518 (197)
+
+128v 192t
+    low_vert: 0.10622711 (174)
+    low_tri:  0.12637363 (207)
+
+====
+160t
+====
+
+64v 160t
+    low_vert: 0.048401553 (162)
+    low_tri:  1 (3347)
+
+96v 160t
+    low_vert: 0.07010895 (148)
+    low_tri:  0.20369492 (430)
+
+128v 160t
+    low_vert: 0.058221024 (108)
+    low_tri:  0.053908356 (100)
+
+160v 160t
+    low_vert: 0.9853896 (1821)
+    low_tri:  0.049242426 (91)
+
+====
+192t
+====
+
+96v 192t
+    low_vert: 0.06733049 (142)
+    low_tri:  0.9971551 (2103)
+
+128v 192t
+    low_vert: 0.10622711 (174)
+    low_tri:  0.12637363 (207)
+
+160v 192t
+    low_vert: 0.77152103 (1192)
+    low_tri:  0.05695793 (88)
+
+====
+224t
+====
+
+128v 224t
+    low_vert: 0.1040724 (161)
+    low_tri:  0.32514545 (503)
+
+160v 224t
+    low_vert: 0.10181818 (140)
+    low_tri:  0.10763636 (148)
+
+*/
 
 const TARGET_MESHLETS_PER_GROUP: usize = 8;
 // Reject groups that keep over 95% of their original triangles
@@ -261,7 +363,7 @@ pub fn export_meshlets_to_xmetal(
         lod_levels.push(parent_level);
     }
 
-    let model_name = "bevy-bunny-upgrade-meshopt";
+    let model_name = format!("bevy-bunny-{MAX_TRIANGLES}t-{MAX_VERTICES}v");
     println!("export_meshlets_to_metal: Writing ");
     write_model(
         format!("/Users/pwong/projects/x-metal2/assets/generated/models/{model_name}/").into(),
@@ -423,6 +525,13 @@ struct MeshletGroups {
 
 impl MeshletGroups {
     pub const NO_GROUP_ID: u16 = u16::MAX;
+    pub fn add_level_offsets(mut self, offset: u16, parent_offset: u16) -> Self {
+        // IMPORTANT: This assumes NO_GROUP_ID is u16::MAX, saturating add any value PRESERVES
+        //            NO_GROUP_ID.
+        self.group_id = self.group_id.saturating_add(offset);
+        self.parent_group_id = self.parent_group_id.saturating_add(parent_offset);
+        self
+    }
 }
 
 struct XMetal2Meshlets {
@@ -665,14 +774,14 @@ impl LODMeshlets {
             );
 
             meshlet_to_lod_groups.extend(level.meshlet_to_lod_groups.iter().map(|g| {
-                MeshletGroups {
-                    group_id: cur_level_offset + g.group_id,
-                    parent_group_id: if is_descending_levels_of_detail {
-                        next_level_offset + g.parent_group_id
+                g.add_level_offsets(
+                    cur_level_offset,
+                    if is_descending_levels_of_detail {
+                        next_level_offset
                     } else {
-                        prev_level_groups_offset + g.parent_group_id
+                        prev_level_groups_offset
                     },
-                }
+                )
             }));
 
             prev_level_groups_offset = cur_level_offset;
@@ -703,10 +812,22 @@ impl LODMeshlets {
     }
 
     fn generate_xmetal_meshlets(&self) -> Arc<[Meshlet]> {
-        self.meshlets
+        let mut low_vert: usize = 0;
+        let mut low_tri: usize = 0;
+        let r = self
+            .meshlets
             .meshlets
             .iter()
             .map(|m| {
+                const SIMD_GROUP_SIZE: usize = 32;
+                assert!((m.vertex_count as usize) <= MAX_VERTICES);
+                if (MAX_VERTICES - (m.vertex_count as usize)) >= SIMD_GROUP_SIZE {
+                    low_vert += 1;
+                }
+                assert!((m.triangle_count as usize) <= MAX_TRIANGLES);
+                if (MAX_TRIANGLES - (m.triangle_count as usize)) >= SIMD_GROUP_SIZE {
+                    low_tri += 1;
+                }
                 Meshlet::new(
                     m.triangle_offset,
                     m.triangle_count,
@@ -715,7 +836,16 @@ impl LODMeshlets {
                 )
             })
             .collect::<Vec<Meshlet>>()
-            .into()
+            .into();
+        println!("\n\n==== generate_xmetal_meshlets STATS ===");
+        // TODO(0): Add a "average occupancy" stat
+        let num_meshlets = self.meshlets.meshlets.len();
+        let pct = (low_vert as f32) / (num_meshlets as f32);
+        println!("{MAX_VERTICES}v {MAX_TRIANGLES}t");
+        println!("low_vert: {pct} ({low_vert})");
+        let pct = (low_tri as f32) / (num_meshlets as f32);
+        println!("low_tri: {pct} ({low_tri})");
+        r
     }
 
     fn model_metadata(&self, vertices: &VertexDataAdapter) -> ModelMetadata {
@@ -858,7 +988,13 @@ fn compute_meshlets(indices: &[u32], vertices: &VertexDataAdapter) -> XMetal2Mes
     // let mut meshlets = build_meshlets(indices, vertices, 64, 192, 0.0);
     // let mut meshlets = build_meshlets(indices, vertices, 128, 192, 0.0);
     // let mut meshlets = build_meshlets(indices, vertices, 32, 32, 0.0);
-    let mut meshlets = build_meshlets(indices, vertices, 160, 192, 0.0);
+    // let mut meshlets = build_meshlets(indices, vertices, 192, 224, 0.0);
+    // let mut meshlets = build_meshlets(indices, vertices, 192, 160, 0.0);
+    // let mut meshlets = build_meshlets(indices, vertices, 160, 192, 0.0);
+    let mut meshlets = build_meshlets(indices, vertices, MAX_VERTICES, MAX_TRIANGLES, 0.0); /* 2.4 ms */
+    // let mut meshlets = build_meshlets(indices, vertices, 192, 224, 0.0); /* 2.4 ms */
+    // let mut meshlets = build_meshlets(indices, vertices, 64, 96, 0.0);   /* 2.6 ms */
+    // let mut meshlets = build_meshlets(indices, vertices, 192, 128, 0.0); /* 2.5 ms */
     let last_meshlet = &meshlets.meshlets[meshlets.meshlets.len() - 1];
     meshlets
         .vertices
@@ -866,19 +1002,6 @@ fn compute_meshlets(indices: &[u32], vertices: &VertexDataAdapter) -> XMetal2Mes
     meshlets
         .triangles
         .truncate((last_meshlet.triangle_offset + last_meshlet.triangle_count * 3) as usize);
-
-    for meshlet in &mut meshlets.meshlets {
-        #[allow(unsafe_code)]
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            meshopt_optimizeMeshlet(
-                &mut meshlets.vertices[meshlet.vertex_offset as usize],
-                &mut meshlets.triangles[meshlet.triangle_offset as usize],
-                meshlet.triangle_count as usize,
-                meshlet.vertex_count as usize,
-            );
-        }
-    }
 
     meshlets.into()
 }
@@ -1027,6 +1150,14 @@ fn simplify_meshlet_group(
 
     // Simplify the group to ~50% triangle count
     let mut error = 0.0;
+    // let simplified_group_indices = simplify(
+    //     &group_indices,
+    //     vertices,
+    //     group_indices.len() / 2,
+    //     f32::MAX,
+    //     SimplifyOptions::Sparse | SimplifyOptions::ErrorAbsolute,
+    //     Some(&mut error),
+    // );
     let simplified_group_indices = simplify_with_attributes_and_locks(
         &group_indices,
         vertices,
@@ -1046,10 +1177,6 @@ fn simplify_meshlet_group(
     {
         return None;
     }
-
-    // Convert error to object-space and convert from diameter to radius
-    error *= simplify_scale(vertices) * 0.5;
-
     Some((simplified_group_indices, error))
 }
 
