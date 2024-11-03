@@ -68,10 +68,6 @@ const MAX_VERTICES: usize = 128;
     low_vert: 0.91082805 (2145)
     low_tri:  0.0836518 (197)
 
-128v 192t
-    low_vert: 0.10622711 (174)
-    low_tri:  0.12637363 (207)
-
 ====
 160t
 ====
@@ -122,7 +118,7 @@ const MAX_VERTICES: usize = 128;
 
 */
 
-const TARGET_MESHLETS_PER_GROUP: usize = 8;
+const TARGET_MESHLETS_PER_GROUP: usize = 16;
 // Reject groups that keep over 95% of their original triangles
 const SIMPLIFICATION_FAILURE_PERCENTAGE: f32 = 0.95;
 
@@ -363,7 +359,7 @@ pub fn export_meshlets_to_xmetal(
         lod_levels.push(parent_level);
     }
 
-    let model_name = format!("bevy-bunny-{MAX_TRIANGLES}t-{MAX_VERTICES}v");
+    let model_name = format!("bevy-bunny-{MAX_TRIANGLES}t-{MAX_VERTICES}v-16x");
     println!("export_meshlets_to_metal: Writing ");
     write_model(
         format!("/Users/pwong/projects/x-metal2/assets/generated/models/{model_name}/").into(),
@@ -772,6 +768,29 @@ impl LODMeshlets {
                 "    [{actual_lod_level}] lod_groups: {num_groups} meshlets: {num_meshlets} lod_level_to_meshlet_end={}",
                 *lod_level_to_meshlet_end.last().unwrap()
             );
+            {
+                let mut low_vert: usize = 0;
+                let mut low_tri: usize = 0;
+                for m in &level.meshlets.meshlets {
+                    const SIMD_GROUP_SIZE: usize = 32;
+                    assert!((m.vertex_count as usize) <= MAX_VERTICES);
+                    if (MAX_VERTICES - (m.vertex_count as usize)) >= SIMD_GROUP_SIZE {
+                        low_vert += 1;
+                    }
+                    assert!((m.triangle_count as usize) <= MAX_TRIANGLES);
+                    if (MAX_TRIANGLES - (m.triangle_count as usize)) >= SIMD_GROUP_SIZE {
+                        low_tri += 1;
+                    }
+                }
+                println!(
+                    "      - low_vert: {} ({low_vert})",
+                    (low_vert as f32) / (num_meshlets as f32)
+                );
+                println!(
+                    "      - low_tri:  {} ({low_tri})",
+                    (low_tri as f32) / (num_meshlets as f32)
+                );
+            };
 
             meshlet_to_lod_groups.extend(level.meshlet_to_lod_groups.iter().map(|g| {
                 g.add_level_offsets(
@@ -838,10 +857,10 @@ impl LODMeshlets {
             .collect::<Vec<Meshlet>>()
             .into();
         println!("\n\n==== generate_xmetal_meshlets STATS ===");
-        // TODO(0): Add a "average occupancy" stat
         let num_meshlets = self.meshlets.meshlets.len();
+        println!("{MAX_TRIANGLES}t {MAX_VERTICES}v");
+
         let pct = (low_vert as f32) / (num_meshlets as f32);
-        println!("{MAX_VERTICES}v {MAX_TRIANGLES}t");
         println!("low_vert: {pct} ({low_vert})");
         let pct = (low_tri as f32) / (num_meshlets as f32);
         println!("low_tri: {pct} ({low_tri})");
@@ -1150,14 +1169,6 @@ fn simplify_meshlet_group(
 
     // Simplify the group to ~50% triangle count
     let mut error = 0.0;
-    // let simplified_group_indices = simplify(
-    //     &group_indices,
-    //     vertices,
-    //     group_indices.len() / 2,
-    //     f32::MAX,
-    //     SimplifyOptions::Sparse | SimplifyOptions::ErrorAbsolute,
-    //     Some(&mut error),
-    // );
     let simplified_group_indices = simplify_with_attributes_and_locks(
         &group_indices,
         vertices,
